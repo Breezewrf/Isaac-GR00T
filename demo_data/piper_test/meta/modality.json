@@ -1,0 +1,33 @@
+{
+   "state": {
+        "single_arm": {
+            "start": 0,
+            "end": 6
+        },
+        "gripper": {
+            "start": 6,
+            "end": 7
+        }
+    },
+  "action": {
+          "single_arm": {
+              "start": 0,
+              "end": 6
+          },
+          "gripper": {
+              "start": 6,
+              "end": 7
+          }
+      },
+  "video": {
+    "cam_1": {
+      "original_key": "observation.images.cam_1"
+    }
+  },
+  "annotation": {
+        "human.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}
+
