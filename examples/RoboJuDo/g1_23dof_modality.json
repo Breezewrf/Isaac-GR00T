@@ -1,0 +1,35 @@
+{
+    "state": {
+        "left_arm": {
+            "start": 0,
+            "end": 5
+        },
+        "right_arm": {
+            "start": 5,
+            "end": 10
+        }
+    },
+    "action": {
+        "left_arm": {
+            "start": 0,
+            "end": 5
+        },
+        "right_arm": {
+            "start": 5,
+            "end": 10
+        },
+        "navigate_command": {
+            "start": 10,
+            "end": 13
+        },
+        "base_height_command": {
+            "start": 13,
+            "end": 14
+        }
+    },
+    "video": {
+        "ego_view": {
+            "original_key": "observation.images.head_rgb"
+        }
+    }
+}
