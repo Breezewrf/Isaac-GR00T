@@ -97,7 +97,7 @@ class RoboJuDoPolicyAdapter:
         positions = self._ordered_joint_positions(joint_positions)
         split = self.profile.arm_width
         return {
-            "video": {"ego_view": image[None, None]},
+            "video": {"head_view": image[None, None]},
             "state": {
                 "left_arm": positions[:split][None, None],
                 "right_arm": positions[split:][None, None],

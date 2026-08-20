@@ -12,20 +12,33 @@ import threading
 import time
 
 import cv2
+from deploy_adapter import PROFILES, RoboJuDoPolicyAdapter
+from gr00t.policy.server_client import PolicyClient
 import msgpack
 import numpy as np
 import zmq
-
-from deploy_adapter import PROFILES, RoboJuDoPolicyAdapter
-from gr00t.policy.server_client import PolicyClient
+from zmq.utils.monitor import recv_monitor_message
 
 
 @dataclass(frozen=True)
 class Observation:
+    stream_id: str
+    control_session: int
+    takeover_enabled: bool
     sequence: int
     image: np.ndarray
     joint_positions: dict[str, float]
     task: str
+
+
+@dataclass(frozen=True)
+class ActionChunk:
+    stream_id: str
+    control_session: int
+    observation_sequence: int
+    observation_received_at: float
+    inference_seconds: float
+    commands: list[dict]
 
 
 class ObservationSubscriber:
@@ -55,14 +68,18 @@ class ObservationSubscriber:
             raise ValueError(f"RoboJuDo observation has {len(parts)} parts, expected 2")
         header = msgpack.unpackb(parts[0], raw=False)
         if header.get("protocol_version") != 1:
-            raise ValueError(f"unsupported RoboJuDo protocol version {header.get('protocol_version')!r}")
+            raise ValueError(
+                f"unsupported RoboJuDo protocol version {header.get('protocol_version')!r}"
+            )
         if header.get("profile") != self.profile:
             raise ValueError(
                 f"RoboJuDo profile {header.get('profile')!r} does not match {self.profile!r}"
             )
         joint_names = tuple(header.get("joint_names", ()))
         if joint_names != self.expected_joint_names:
-            raise ValueError("RoboJuDo observation joint order does not match the deployment profile")
+            raise ValueError(
+                "RoboJuDo observation joint order does not match the deployment profile"
+            )
         positions = np.asarray(header.get("joint_positions"), dtype=np.float32)
         if positions.shape != (len(joint_names),) or not np.isfinite(positions).all():
             raise ValueError("RoboJuDo observation contains invalid joint positions")
@@ -76,7 +93,23 @@ class ObservationSubscriber:
         task = str(header.get("task", "")).strip()
         if not task:
             raise ValueError("RoboJuDo observation task must not be empty")
+        stream_id = header.get("stream_id")
+        if not isinstance(stream_id, str) or not stream_id.strip():
+            raise ValueError("RoboJuDo observation stream_id must be a non-empty string")
+        control_session = header.get("control_session")
+        if (
+            isinstance(control_session, bool)
+            or not isinstance(control_session, int)
+            or control_session < 0
+        ):
+            raise ValueError("RoboJuDo observation control_session must be a non-negative integer")
+        takeover_enabled = header.get("takeover_enabled")
+        if not isinstance(takeover_enabled, bool):
+            raise ValueError("RoboJuDo observation takeover_enabled must be a boolean")
         return Observation(
+            stream_id=stream_id,
+            control_session=control_session,
+            takeover_enabled=takeover_enabled,
             sequence=int(header["sequence"]),
             image=image,
             joint_positions=dict(zip(joint_names, positions.tolist(), strict=True)),
@@ -101,6 +134,7 @@ class DoubleBufferedPolicyRunner:
         execution_horizon: int,
         command_fps: float,
         observation_timeout: float,
+        status_interval: float,
         task_override: str | None,
     ):
         self.profile = profile
@@ -110,34 +144,102 @@ class DoubleBufferedPolicyRunner:
         self.execution_horizon = execution_horizon
         self.command_period = 1.0 / command_fps
         self.observation_timeout = observation_timeout
+        self.status_interval = status_interval
         self.task_override = task_override
+        # Coordinates the latest observation and the cross-thread pending slot.
         self._condition = threading.Condition()
         self._stopping = False
         self._latest_observation: Observation | None = None
         self._latest_observation_at = float("-inf")
+        self._last_inferred_session: tuple[str, int] | None = None
         self._last_inferred_sequence = -1
-        self._pending_commands: tuple[float, list[dict]] | None = None
+        self._pending_commands: ActionChunk | None = None
         self._error: Exception | None = None
         self._context = zmq.Context()
         self._publisher = self._context.socket(zmq.PUB)
         self._publisher.setsockopt(zmq.LINGER, 0)
         self._publisher.setsockopt(zmq.SNDHWM, 16)
+        self._publisher_monitor = self._publisher.get_monitor_socket(
+            events=zmq.EVENT_ACCEPTED | zmq.EVENT_DISCONNECTED
+        )
         self._publisher.bind(command_endpoint)
+        self._command_subscriber_connected = False
         self._observation_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
 
     def _receive_loop(self):
         first_observation = True
+        connected_at = time.monotonic()
+        report_started_at = connected_at
+        report_observations = 0
+        report_sequence_gaps = 0
+        last_stream_id = None
+        last_sequence = None
+
+        def report_health(now: float):
+            nonlocal report_started_at, report_observations, report_sequence_gaps
+            report_elapsed = now - report_started_at
+            if report_elapsed < self.status_interval:
+                return
+            if report_observations:
+                print(
+                    f"[observation] rate={report_observations / report_elapsed:.1f}Hz, "
+                    f"received={report_observations}, last_sequence={last_sequence}, "
+                    f"sequence_gaps={report_sequence_gaps}",
+                    flush=True,
+                )
+            elif last_sequence is None:
+                print(
+                    f"[observation] still waiting for first frame "
+                    f"({now - connected_at:.1f}s elapsed)",
+                    flush=True,
+                )
+            else:
+                with self._condition:
+                    latest_at = self._latest_observation_at
+                print(
+                    f"[observation] no frame for {now - latest_at:.2f}s; "
+                    f"last_sequence={last_sequence}",
+                    flush=True,
+                )
+            report_started_at = now
+            report_observations = 0
+            report_sequence_gaps = 0
+
         try:
             self.subscriber.connect()
             print(f"Connected to RoboJuDo observations at {self.subscriber.endpoint}", flush=True)
             while not self._stopping:
                 observation = self.subscriber.receive()
                 if observation is None:
+                    report_health(time.monotonic())
                     continue
+                now = time.monotonic()
+                if observation.stream_id != last_stream_id:
+                    if last_stream_id is not None:
+                        print(
+                            f"[observation] stream changed: {last_stream_id} -> "
+                            f"{observation.stream_id}",
+                            flush=True,
+                        )
+                    last_stream_id = observation.stream_id
+                    last_sequence = None
+                if last_sequence is not None:
+                    if observation.sequence <= last_sequence:
+                        print(
+                            f"[observation] ignored non-increasing sequence "
+                            f"{observation.sequence} after {last_sequence}",
+                            flush=True,
+                        )
+                        continue
+                    report_sequence_gaps += observation.sequence - last_sequence - 1
+                last_sequence = observation.sequence
+                report_observations += 1
                 if first_observation:
                     print(
                         f"Received first observation: sequence={observation.sequence}, "
+                        f"session={observation.control_session}, "
+                        f"takeover_enabled={observation.takeover_enabled}, "
                         f"image={observation.image.shape}, joints={len(observation.joint_positions)}",
                         flush=True,
                     )
@@ -146,6 +248,7 @@ class DoubleBufferedPolicyRunner:
                     self._latest_observation = observation
                     self._latest_observation_at = time.monotonic()
                     self._condition.notify_all()
+                report_health(now)
         except Exception as exc:
             self._set_error(exc)
         finally:
@@ -166,27 +269,75 @@ class DoubleBufferedPolicyRunner:
             while True:
                 with self._condition:
                     self._condition.wait_for(
-                        lambda: self._stopping
-                        or self._error is not None
-                        or (
-                            self._pending_commands is None
-                            and self._latest_observation is not None
-                            and self._latest_observation.sequence > self._last_inferred_sequence
+                        lambda: (
+                            self._stopping
+                            or self._error is not None
+                            or (
+                                self._pending_commands is None
+                                and self._latest_observation is not None
+                                and self._latest_observation.takeover_enabled
+                                and (
+                                    (
+                                        self._latest_observation.stream_id,
+                                        self._latest_observation.control_session,
+                                    )
+                                    != self._last_inferred_session
+                                    or self._latest_observation.sequence
+                                    > self._last_inferred_sequence
+                                )
+                            )
                         )
                     )
                     if self._stopping or self._error is not None:
                         return
                     observation = self._latest_observation
                     observation_received_at = self._latest_observation_at
+                    observation_session = (
+                        observation.stream_id,
+                        observation.control_session,
+                    )
+                    self._last_inferred_session = observation_session
                     self._last_inferred_sequence = observation.sequence
+                inference_started_at = time.monotonic()
                 commands = adapter.get_action(
                     image=observation.image,
                     joint_positions=observation.joint_positions,
                     instruction=self.task_override or observation.task,
                     execution_horizon=self.execution_horizon,
                 )
+                if not commands:
+                    raise ValueError(
+                        f"GR00T returned an empty action chunk for observation {observation.sequence}"
+                    )
+                inference_seconds = time.monotonic() - inference_started_at
+                print(
+                    f"[inference] chunk ready: observation_sequence={observation.sequence}, "
+                    f"session={observation.control_session}, "
+                    f"actions={len(commands)}, latency={inference_seconds:.3f}s",
+                    flush=True,
+                )
                 with self._condition:
-                    self._pending_commands = (observation_received_at, commands)
+                    latest = self._latest_observation
+                    if (
+                        latest is None
+                        or not latest.takeover_enabled
+                        or (latest.stream_id, latest.control_session) != observation_session
+                    ):
+                        print(
+                            f"[inference] discarded chunk from inactive session "
+                            f"{observation.stream_id}:{observation.control_session}",
+                            flush=True,
+                        )
+                        self._condition.notify_all()
+                        continue
+                    self._pending_commands = ActionChunk(
+                        stream_id=observation.stream_id,
+                        control_session=observation.control_session,
+                        observation_sequence=observation.sequence,
+                        observation_received_at=observation_received_at,
+                        inference_seconds=inference_seconds,
+                        commands=commands,
+                    )
                     self._condition.notify_all()
         except Exception as exc:
             self._set_error(exc)
@@ -198,6 +349,19 @@ class DoubleBufferedPolicyRunner:
             self._error = exc
             self._condition.notify_all()
 
+    def _poll_command_subscriber(self):
+        while self._publisher_monitor.poll(0, zmq.POLLIN):
+            event = recv_monitor_message(self._publisher_monitor)
+            endpoint = event.get("endpoint", b"")
+            if isinstance(endpoint, bytes):
+                endpoint = endpoint.decode(errors="replace")
+            if event["event"] == zmq.EVENT_ACCEPTED:
+                self._command_subscriber_connected = True
+                print(f"[command] subscriber connected: {endpoint}", flush=True)
+            elif event["event"] == zmq.EVENT_DISCONNECTED:
+                self._command_subscriber_connected = False
+                print(f"[command] subscriber disconnected: {endpoint}", flush=True)
+
     def run(self):
         print("Waiting for the first RoboJuDo observation and GR00T action chunk...", flush=True)
         self._observation_thread.start()
@@ -207,32 +371,121 @@ class DoubleBufferedPolicyRunner:
         command_sequence = 0
         command_stream_started = False
         observation_was_fresh = False
+        control_was_enabled = False
+        active_session: tuple[str, int] | None = None
+        holding_last_command = False
+        report_started_at = time.monotonic()
+        report_commands = 0
         next_command_at = time.monotonic()
         while True:
+            self._poll_command_subscriber()
             with self._condition:
                 if self._error is not None:
                     raise RuntimeError("RoboJuDo deployment worker failed") from self._error
                 now = time.monotonic()
                 observation_fresh = now - self._latest_observation_at <= self.observation_timeout
+                latest = self._latest_observation
+                control_enabled = bool(
+                    observation_fresh and latest is not None and latest.takeover_enabled
+                )
+                current_session = (
+                    (latest.stream_id, latest.control_session) if latest is not None else None
+                )
                 if not observation_fresh:
                     if observation_was_fresh:
-                        print("RoboJuDo observation timed out; command publishing stopped", flush=True)
+                        print(
+                            "RoboJuDo observation timed out; command publishing stopped", flush=True
+                        )
                     active_commands.clear()
                     last_command = None
                     self._pending_commands = None
-                elif not active_commands and self._pending_commands is not None:
-                    observation_received_at, commands = self._pending_commands
+                    holding_last_command = False
+                    active_session = None
+                elif not observation_was_fresh:
+                    print("RoboJuDo observation stream is fresh", flush=True)
+                if observation_fresh and not control_enabled:
+                    cleared_pending = self._pending_commands is not None
+                    if control_was_enabled:
+                        print(
+                            "[control] takeover disabled; cleared active and pending commands",
+                            flush=True,
+                        )
+                    active_commands.clear()
+                    last_command = None
+                    self._pending_commands = None
+                    holding_last_command = False
+                    active_session = None
+                    if control_was_enabled or cleared_pending:
+                        self._condition.notify_all()
+                elif control_enabled and current_session != active_session:
+                    active_commands.clear()
+                    last_command = None
+                    holding_last_command = False
+                    active_session = current_session
+                    pending_session = (
+                        (
+                            self._pending_commands.stream_id,
+                            self._pending_commands.control_session,
+                        )
+                        if self._pending_commands is not None
+                        else None
+                    )
+                    if self._pending_commands is not None and pending_session != current_session:
+                        self._pending_commands = None
+                    self._condition.notify_all()
+                    print(
+                        f"[control] takeover enabled for session "
+                        f"{current_session[0]}:{current_session[1]}; waiting for a fresh chunk",
+                        flush=True,
+                    )
+                if control_enabled and not active_commands and self._pending_commands is not None:
+                    chunk = self._pending_commands
                     self._pending_commands = None
                     self._condition.notify_all()
-                    if now - observation_received_at <= self.observation_timeout:
-                        active_commands.extend(commands)
+                    chunk_age = now - chunk.observation_received_at
+                    chunk_session = (chunk.stream_id, chunk.control_session)
+                    if chunk_session != current_session:
+                        print(
+                            f"[command] discarded chunk from inactive session "
+                            f"{chunk.stream_id}:{chunk.control_session}",
+                            flush=True,
+                        )
+                    elif chunk_age <= self.observation_timeout:
+                        active_commands.extend(chunk.commands)
+                        holding_last_command = False
+                        print(
+                            f"[command] activated chunk: observation_sequence={chunk.observation_sequence}, "
+                            f"session={chunk.control_session}, "
+                            f"actions={len(chunk.commands)}, age={chunk_age:.3f}s, "
+                            f"inference={chunk.inference_seconds:.3f}s",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[command] discarded stale chunk for observation_sequence="
+                            f"{chunk.observation_sequence} (age={chunk_age:.3f}s)",
+                            flush=True,
+                        )
                 observation_was_fresh = observation_fresh
+                control_was_enabled = control_enabled
             if active_commands:
                 last_command = active_commands.popleft()
+                holding_last_command = False
+            elif last_command is not None and not holding_last_command:
+                print(
+                    "[command] action horizon exhausted; holding the last command "
+                    "until the next chunk is ready",
+                    flush=True,
+                )
+                holding_last_command = True
             if last_command is not None:
+                if active_session is None:
+                    raise RuntimeError("cannot publish a command without an active control session")
                 self._publisher.send_json(
                     {
                         "sequence": command_sequence,
+                        "stream_id": active_session[0],
+                        "control_session": active_session[1],
                         "positions": last_command["positions"],
                         "locomotion_command": last_command["locomotion_command"].tolist(),
                     }
@@ -244,6 +497,28 @@ class DoubleBufferedPolicyRunner:
                     )
                     command_stream_started = True
                 command_sequence += 1
+                report_commands += 1
+            report_now = time.monotonic()
+            report_elapsed = report_now - report_started_at
+            if report_elapsed >= self.status_interval:
+                with self._condition:
+                    observation_age = report_now - self._latest_observation_at
+                    inference_pending = self._pending_commands is not None
+                    latest = self._latest_observation
+                    takeover_enabled = bool(latest and latest.takeover_enabled)
+                    control_session = None if latest is None else latest.control_session
+                print(
+                    f"[command] rate={report_commands / report_elapsed:.1f}Hz, "
+                    f"published={report_commands}, next_sequence={command_sequence}, "
+                    f"subscriber_connected={self._command_subscriber_connected}, "
+                    f"chunk_remaining={len(active_commands)}, holding={holding_last_command}, "
+                    f"inference_chunk_pending={inference_pending}, "
+                    f"observation_age={observation_age:.3f}s, "
+                    f"takeover_enabled={takeover_enabled}, control_session={control_session}",
+                    flush=True,
+                )
+                report_started_at = report_now
+                report_commands = 0
             next_command_at += self.command_period
             time.sleep(max(0.0, next_command_at - time.monotonic()))
 
@@ -253,6 +528,8 @@ class DoubleBufferedPolicyRunner:
             self._condition.notify_all()
         self._observation_thread.join(timeout=2)
         self._inference_thread.join(timeout=2)
+        self._publisher.disable_monitor()
+        self._publisher_monitor.close(linger=0)
         self._publisher.close(linger=0)
         self._context.term()
 
@@ -267,8 +544,18 @@ def parse_args():
     parser.add_argument("--execution-horizon", type=int, default=8)
     parser.add_argument("--command-fps", type=float, default=30.0)
     parser.add_argument("--observation-timeout", type=float, default=1.0)
+    parser.add_argument("--status-interval", type=float, default=5.0)
     parser.add_argument("--task", default=None, help="Override the task sent by RoboJuDo")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.execution_horizon <= 0:
+        parser.error("--execution-horizon must be positive")
+    if args.command_fps <= 0:
+        parser.error("--command-fps must be positive")
+    if args.observation_timeout <= 0:
+        parser.error("--observation-timeout must be positive")
+    if args.status_interval <= 0:
+        parser.error("--status-interval must be positive")
+    return args
 
 
 def main():
@@ -288,6 +575,7 @@ def main():
         execution_horizon=args.execution_horizon,
         command_fps=args.command_fps,
         observation_timeout=args.observation_timeout,
+        status_interval=args.status_interval,
         task_override=args.task,
     )
     try:
