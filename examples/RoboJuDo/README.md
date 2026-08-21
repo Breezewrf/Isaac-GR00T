@@ -137,8 +137,128 @@ uv run python examples/RoboJuDo/run_robojudo_client.py \
 ```
 
 Use `--profile x2` for X2. The client validates the profile and exact joint order before inference.
-It double-buffers action chunks: one thread receives the latest RoboJuDo observation, one performs
-policy inference, and the command loop keeps publishing at 30 Hz while the next chunk is prepared.
+One thread receives the latest RoboJuDo observation, one performs policy inference, and the command
+loop keeps publishing at 30 Hz. Select the action scheduler with `--execution-mode`.
+
+### Execution modes
+
+The default preserves the original **asynchronous double-buffer** behavior:
+
+```bash
+uv run python examples/RoboJuDo/run_robojudo_client.py \
+  --profile x2 \
+  --robot-endpoint tcp://127.0.0.1:8561 \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --command-endpoint tcp://*:8559 \
+  --execution-mode double_buffer \
+  --execution-horizon 8
+```
+在双缓冲模式下, execution_horizon 表示每次连续执行多少步：
+```
+chunk A 执行 N 步
+  → 切换 chunk B
+```
+  
+
+**ACT-style Temporal Ensemble** continuously infers new chunks and blends predictions that cover the
+same 30 Hz control tick:
+
+```bash
+uv run python examples/RoboJuDo/run_robojudo_client.py \
+  --profile x2 \
+  --robot-endpoint tcp://127.0.0.1:8561 \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --command-endpoint tcp://*:8559 \
+  --execution-mode temporal_ensemble \
+  --execution-horizon 16 \
+  --temporal-ensemble-coeff 0.01
+```
+
+`--temporal-ensemble-coeff 0` gives a direct average. The ACT value `0.01` exponentially gives
+slightly more weight to older predictions. `--execution-mode rtc` is reserved in the CLI so RTC can
+be added without another interface change, but currently exits with an explicit not-implemented
+error rather than silently selecting a different scheduler.
+
+Temporal Ensemble assigns each prediction to the command tick at which inference started. If a
+request made at tick 0 returns at tick 3, actions 0 through 2 have already expired and action 3 is
+the first eligible result. With later overlapping chunks, the time-aligned diagonal is averaged:
+
+```text
+30 Hz tick              0       1       2       3       4       5       6
+
+infer chunk A           [--------- inference -------->]
+A prediction time       A0      A1      A2      A3      A4      A5      A6
+published A             -       -       -       A3      A4      A5      A6
+
+infer chunk B                                   [--------- inference -------->]
+B prediction time                               B0      B1      B2      B3
+published ensemble      -       -       -       A3      A4      A5   avg(A6,B3)
+```
+
+**在 Temporal Ensemble 模式下, execution_horizon不再表示“连续执行 N 步”，而每个 chunk 在 ensemble 时间轴上的有效长度.**
+```
+当前默认的参数是：
+  有效 execution_horizon H = 16 tick
+  推理间隔 Q ≈ 2～3 tick
+  推理延迟 D ≈ 2～3 tick
+
+  由于一个 chunk 返回时已经过去约 2～3 步，它实际能参与 ensemble 的剩余长度约为：
+
+  H - D = 16 - 2～3 = 13～14 tick
+
+  每隔约 2～3 tick 又产生一个新 chunk，因此稳态 contributor 数量大约是：
+
+  N ≈ (H - D) / Q
+    ≈ 13.5 / 2.3
+    ≈ 5.9
+
+  日志中就可以看到ensemble_chunks=6, ensemble_contributors=6
+
+按当前约 2.5 tick 一次推理估算：
+
+   execution horizon    最大时间跨度    contributor 数量    特点
+  ━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━
+                   8          267 ms              约 2–3    响应更快，平滑较弱
+  ───────────────────  ──────────────  ──────────────────  ──────────────────────
+                  12          400 ms                约 4    中间选择
+  ───────────────────  ──────────────  ──────────────────  ──────────────────────
+                  16          533 ms              约 5–6    平滑较强，可能更滞后
+
+  最大时间跨度是 chunk 从 query 开始计算的。16 步对应：
+
+  (16 - 1) / 30 = 500 ms
+
+  最老的有效预测可能基于约 0.5 秒前的 observation
+```
+  
+
+
+当前模型训练default配置为：
+  `delta_indices=list(range(16))`
+  即模型预测 16 步、约 533 ms 的未来动作。
+  
+  Temporal Ensemble 建议使用全部 16 步，而不是当前截断后的 8 步： 推理延迟约 3 步, 返回后仍剩 13 步可以参与 ensemble, 下一次推理约 3 步后返回
+, 通常会有多个 chunk 重叠
+
+--temporal-ensemble-coeff 0.01 的权重比较温和。例如最老和最新预测相差 14 tick 时：
+```py
+  oldest weight = 1.0
+  newest weight = exp(-0.01 × 14) ≈ 0.87
+```
+  所以目前接近均匀平均，只是稍微偏向旧预测。
+
+  接下来主要需要观察真机动作效果：
+  - 如果抖动明显减少且响应速度正常：保留 0.01。
+  - 如果仍有小幅抖动：可以试 0，直接平均通常会更平滑一些。
+  - 如果动作明显滞后：可能是 16 步历史预测参与过多，需限制 ensemble 历史长度，而不是盲目增大 coefficient。
+  - 如果动作太依赖旧意图：可以降低最大 contributor 数量，例如只保留最近 3–4 个 chunk。
+
+This is temporal alignment, not RTC: expired indices are skipped, but the model is not re-run or
+corrected for measured inference delay. Unlike LeRobot ACT's online implementation, which assumes
+one inference result **every control step**, this client retains a small set of absolute-tick chunks so
+the same diagonal weighting remains valid when GR00T returns a chunk every few control steps.
 
 ### Double-buffer execution
 
@@ -216,16 +336,21 @@ restarted. Every command carries the same `stream_id` and `control_session`; Rob
 command unless it belongs to the currently enabled session, so an old buffered command cannot be
 applied during an enable transition.
 
-Chunk replacement happens only at the boundary: the client executes every command in the active
-chunk, then activates the pending chunk. It does not align or average overlapping predictions, so
-the current implementation is double-buffered asynchronous inference, not Temporal Ensemble. A
-pending chunk is also not replaced by a newer prediction while it is waiting.
+In `double_buffer` mode, chunk replacement happens only at the boundary: the client executes every
+command in the active chunk, then activates the pending chunk. It does not align or average
+overlapping predictions. A pending chunk is also not replaced by a newer prediction while it is
+waiting.
 
 If the active horizon finishes before another chunk is ready, the client keeps publishing the last
 command. This includes its locomotion values, so a non-zero velocity command is held until a new
 chunk arrives, the observation stream times out, or the robot-side watchdog stops it. If the
 observation age exceeds `--observation-timeout`, the client clears both active and pending actions
 and stops publishing until observations become fresh again.
+
+In `temporal_ensemble` mode, an uncovered tick instead holds the last arm positions and base height
+while forcing `vx`, `vy`, and `yaw_rate` to zero. Takeover disable, session changes, stream changes,
+and observation timeout clear all ensemble history; a result returning from an old session is
+discarded before it can enter the ensemble.
 
 ### Port binding
 The two robot-side ports have opposite directions:

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the double-buffered RoboJuDo observation-to-command deployment loop."""
+"""Run a selectable asynchronous RoboJuDo observation-to-command deployment loop."""
 
 from __future__ import annotations
 
@@ -18,6 +18,9 @@ import msgpack
 import numpy as np
 import zmq
 from zmq.utils.monitor import recv_monitor_message
+
+
+EXECUTION_MODES = ("double_buffer", "temporal_ensemble", "rtc")
 
 
 @dataclass(frozen=True)
@@ -38,7 +41,99 @@ class ActionChunk:
     observation_sequence: int
     observation_received_at: float
     inference_seconds: float
+    start_tick: int
     commands: list[dict]
+
+
+@dataclass(frozen=True)
+class _EnsembleChunk:
+    start_tick: int
+    actions: np.ndarray
+
+
+class ACTTemporalEnsembler:
+    """ACT-style temporal ensemble generalized to asynchronously returned chunks."""
+
+    def __init__(self, joint_names: tuple[str, ...], temporal_ensemble_coeff: float):
+        self.joint_names = joint_names
+        self.temporal_ensemble_coeff = temporal_ensemble_coeff
+        self._chunks: deque[_EnsembleChunk] = deque()
+
+    @property
+    def active_chunk_count(self) -> int:
+        return len(self._chunks)
+
+    def reset(self):
+        self._chunks.clear()
+
+    def _pack_command(self, command: dict) -> np.ndarray:
+        positions = command.get("positions")
+        if not isinstance(positions, dict):
+            raise ValueError("Temporal Ensemble command positions must be a dictionary")
+        missing = [name for name in self.joint_names if name not in positions]
+        if missing:
+            raise ValueError(f"Temporal Ensemble command is missing joints: {missing}")
+        locomotion = np.asarray(command.get("locomotion_command"), dtype=np.float32)
+        if locomotion.shape != (4,):
+            raise ValueError(
+                f"Temporal Ensemble locomotion command has shape {locomotion.shape}, expected (4,)"
+            )
+        action = np.asarray(
+            [positions[name] for name in self.joint_names] + locomotion.tolist(),
+            dtype=np.float32,
+        )
+        if not np.isfinite(action).all():
+            raise ValueError("Temporal Ensemble command contains non-finite values")
+        return action
+
+    def _unpack_command(self, action: np.ndarray) -> dict:
+        joint_count = len(self.joint_names)
+        return {
+            "positions": dict(zip(self.joint_names, action[:joint_count].tolist(), strict=True)),
+            "locomotion_command": action[joint_count:].astype(np.float32, copy=True),
+        }
+
+    def add_chunk(self, chunk: ActionChunk):
+        actions = np.stack([self._pack_command(command) for command in chunk.commands])
+        self._chunks.append(_EnsembleChunk(start_tick=chunk.start_tick, actions=actions))
+
+    def get_action(self, current_tick: int) -> tuple[dict | None, int]:
+        while (
+            self._chunks
+            and self._chunks[0].start_tick + len(self._chunks[0].actions) <= current_tick
+        ):
+            self._chunks.popleft()
+
+        predictions = []
+        prediction_start_ticks = []
+        for chunk in self._chunks:
+            action_index = current_tick - chunk.start_tick
+            if 0 <= action_index < len(chunk.actions):
+                predictions.append(chunk.actions[action_index])
+                prediction_start_ticks.append(chunk.start_tick)
+        if not predictions:
+            return None, 0
+
+        stacked = np.stack(predictions)
+        prediction_offsets = np.asarray(prediction_start_ticks, dtype=np.float32)
+        prediction_offsets -= prediction_offsets[0]
+        weights = np.exp(-self.temporal_ensemble_coeff * prediction_offsets)
+        if not np.isfinite(weights).all():
+            raise ValueError("Temporal Ensemble produced non-finite weights")
+        ensembled = np.average(stacked, axis=0, weights=weights).astype(np.float32)
+        return self._unpack_command(ensembled), len(predictions)
+
+
+def make_safe_hold_command(command: dict) -> dict:
+    """Hold arm/height while stopping planar locomotion after prediction exhaustion."""
+    locomotion = np.asarray(command["locomotion_command"], dtype=np.float32).copy()
+    if locomotion.shape != (4,):
+        raise ValueError(f"locomotion command has shape {locomotion.shape}, expected (4,)")
+    locomotion[:3] = 0.0
+    return {
+        "positions": dict(command["positions"]),
+        "locomotion_command": locomotion,
+    }
 
 
 class ObservationSubscriber:
@@ -136,6 +231,8 @@ class DoubleBufferedPolicyRunner:
         observation_timeout: float,
         status_interval: float,
         task_override: str | None,
+        execution_mode: str = "double_buffer",
+        temporal_ensemble_coeff: float = 0.01,
     ):
         self.profile = profile
         self.policy_host = policy_host
@@ -146,7 +243,9 @@ class DoubleBufferedPolicyRunner:
         self.observation_timeout = observation_timeout
         self.status_interval = status_interval
         self.task_override = task_override
-        # Coordinates the latest observation and the cross-thread pending slot.
+        self.execution_mode = execution_mode
+        self.temporal_ensemble_coeff = temporal_ensemble_coeff
+        # Coordinates observations, inference results, and the command-loop tick.
         self._condition = threading.Condition()
         self._stopping = False
         self._latest_observation: Observation | None = None
@@ -154,6 +253,9 @@ class DoubleBufferedPolicyRunner:
         self._last_inferred_session: tuple[str, int] | None = None
         self._last_inferred_sequence = -1
         self._pending_commands: ActionChunk | None = None
+        self._ready_chunks: deque[ActionChunk] = deque()
+        self._control_tick = 0
+        self._control_tick_session: tuple[str, int] | None = None
         self._error: Exception | None = None
         self._context = zmq.Context()
         self._publisher = self._context.socket(zmq.PUB)
@@ -273,7 +375,10 @@ class DoubleBufferedPolicyRunner:
                             self._stopping
                             or self._error is not None
                             or (
-                                self._pending_commands is None
+                                (
+                                    self.execution_mode == "temporal_ensemble"
+                                    or self._pending_commands is None
+                                )
                                 and self._latest_observation is not None
                                 and self._latest_observation.takeover_enabled
                                 and (
@@ -296,6 +401,11 @@ class DoubleBufferedPolicyRunner:
                         observation.stream_id,
                         observation.control_session,
                     )
+                    query_tick = (
+                        self._control_tick
+                        if self._control_tick_session == observation_session
+                        else 0
+                    )
                     self._last_inferred_session = observation_session
                     self._last_inferred_sequence = observation.sequence
                 inference_started_at = time.monotonic()
@@ -310,12 +420,6 @@ class DoubleBufferedPolicyRunner:
                         f"GR00T returned an empty action chunk for observation {observation.sequence}"
                     )
                 inference_seconds = time.monotonic() - inference_started_at
-                print(
-                    f"[inference] chunk ready: observation_sequence={observation.sequence}, "
-                    f"session={observation.control_session}, "
-                    f"actions={len(commands)}, latency={inference_seconds:.3f}s",
-                    flush=True,
-                )
                 with self._condition:
                     latest = self._latest_observation
                     if (
@@ -330,15 +434,33 @@ class DoubleBufferedPolicyRunner:
                         )
                         self._condition.notify_all()
                         continue
-                    self._pending_commands = ActionChunk(
+                    chunk = ActionChunk(
                         stream_id=observation.stream_id,
                         control_session=observation.control_session,
                         observation_sequence=observation.sequence,
                         observation_received_at=observation_received_at,
                         inference_seconds=inference_seconds,
+                        start_tick=query_tick,
                         commands=commands,
                     )
+                    ready_tick = (
+                        self._control_tick
+                        if self._control_tick_session == observation_session
+                        else query_tick
+                    )
+                    if self.execution_mode == "temporal_ensemble":
+                        self._ready_chunks.append(chunk)
+                    else:
+                        self._pending_commands = chunk
                     self._condition.notify_all()
+                skipped_steps = max(0, ready_tick - query_tick)
+                print(
+                    f"[inference] chunk ready: observation_sequence={observation.sequence}, "
+                    f"session={observation.control_session}, actions={len(commands)}, "
+                    f"latency={inference_seconds:.3f}s, query_tick={query_tick}, "
+                    f"ready_tick={ready_tick}, skipped_steps={skipped_steps}",
+                    flush=True,
+                )
         except Exception as exc:
             self._set_error(exc)
         finally:
@@ -367,6 +489,14 @@ class DoubleBufferedPolicyRunner:
         self._observation_thread.start()
         self._inference_thread.start()
         active_commands: deque[dict] = deque()
+        temporal_ensembler = (
+            ACTTemporalEnsembler(
+                PROFILES[self.profile].joint_names,
+                self.temporal_ensemble_coeff,
+            )
+            if self.execution_mode == "temporal_ensemble"
+            else None
+        )
         last_command = None
         command_sequence = 0
         command_stream_started = False
@@ -377,8 +507,11 @@ class DoubleBufferedPolicyRunner:
         report_started_at = time.monotonic()
         report_commands = 0
         next_command_at = time.monotonic()
+        ensemble_contributors = 0
         while True:
             self._poll_command_subscriber()
+            ready_chunks = []
+            current_tick = 0
             with self._condition:
                 if self._error is not None:
                     raise RuntimeError("RoboJuDo deployment worker failed") from self._error
@@ -399,6 +532,11 @@ class DoubleBufferedPolicyRunner:
                     active_commands.clear()
                     last_command = None
                     self._pending_commands = None
+                    self._ready_chunks.clear()
+                    if temporal_ensembler is not None:
+                        temporal_ensembler.reset()
+                    self._control_tick = 0
+                    self._control_tick_session = None
                     holding_last_command = False
                     active_session = None
                 elif not observation_was_fresh:
@@ -413,6 +551,11 @@ class DoubleBufferedPolicyRunner:
                     active_commands.clear()
                     last_command = None
                     self._pending_commands = None
+                    self._ready_chunks.clear()
+                    if temporal_ensembler is not None:
+                        temporal_ensembler.reset()
+                    self._control_tick = 0
+                    self._control_tick_session = None
                     holding_last_command = False
                     active_session = None
                     if control_was_enabled or cleared_pending:
@@ -422,6 +565,10 @@ class DoubleBufferedPolicyRunner:
                     last_command = None
                     holding_last_command = False
                     active_session = current_session
+                    self._control_tick = 0
+                    self._control_tick_session = current_session
+                    if temporal_ensembler is not None:
+                        temporal_ensembler.reset()
                     pending_session = (
                         (
                             self._pending_commands.stream_id,
@@ -432,13 +579,23 @@ class DoubleBufferedPolicyRunner:
                     )
                     if self._pending_commands is not None and pending_session != current_session:
                         self._pending_commands = None
+                    self._ready_chunks = deque(
+                        chunk
+                        for chunk in self._ready_chunks
+                        if (chunk.stream_id, chunk.control_session) == current_session
+                    )
                     self._condition.notify_all()
                     print(
                         f"[control] takeover enabled for session "
                         f"{current_session[0]}:{current_session[1]}; waiting for a fresh chunk",
                         flush=True,
                     )
-                if control_enabled and not active_commands and self._pending_commands is not None:
+                if (
+                    self.execution_mode == "double_buffer"
+                    and control_enabled
+                    and not active_commands
+                    and self._pending_commands is not None
+                ):
                     chunk = self._pending_commands
                     self._pending_commands = None
                     self._condition.notify_all()
@@ -466,18 +623,64 @@ class DoubleBufferedPolicyRunner:
                             f"{chunk.observation_sequence} (age={chunk_age:.3f}s)",
                             flush=True,
                         )
+                if self.execution_mode == "temporal_ensemble" and control_enabled:
+                    while self._ready_chunks:
+                        chunk = self._ready_chunks.popleft()
+                        chunk_session = (chunk.stream_id, chunk.control_session)
+                        chunk_age = now - chunk.observation_received_at
+                        if chunk_session != current_session:
+                            print(
+                                f"[command] discarded chunk from inactive session "
+                                f"{chunk.stream_id}:{chunk.control_session}",
+                                flush=True,
+                            )
+                        elif chunk_age <= self.observation_timeout:
+                            ready_chunks.append(chunk)
+                        else:
+                            print(
+                                f"[command] discarded stale chunk for observation_sequence="
+                                f"{chunk.observation_sequence} (age={chunk_age:.3f}s)",
+                                flush=True,
+                            )
+                    current_tick = self._control_tick
                 observation_was_fresh = observation_fresh
                 control_was_enabled = control_enabled
-            if active_commands:
-                last_command = active_commands.popleft()
-                holding_last_command = False
-            elif last_command is not None and not holding_last_command:
-                print(
-                    "[command] action horizon exhausted; holding the last command "
-                    "until the next chunk is ready",
-                    flush=True,
+            if self.execution_mode == "temporal_ensemble":
+                for chunk in ready_chunks:
+                    temporal_ensembler.add_chunk(chunk)
+                    print(
+                        f"[command] added ensemble chunk: "
+                        f"observation_sequence={chunk.observation_sequence}, "
+                        f"session={chunk.control_session}, start_tick={chunk.start_tick}, "
+                        f"actions={len(chunk.commands)}",
+                        flush=True,
+                    )
+                ensembled_command, ensemble_contributors = temporal_ensembler.get_action(
+                    current_tick
                 )
-                holding_last_command = True
+                if ensembled_command is not None:
+                    last_command = ensembled_command
+                    holding_last_command = False
+                elif last_command is not None:
+                    if not holding_last_command:
+                        print(
+                            "[command] Temporal Ensemble horizon exhausted; holding arm/height "
+                            "and setting vx/vy/yaw_rate to zero",
+                            flush=True,
+                        )
+                    last_command = make_safe_hold_command(last_command)
+                    holding_last_command = True
+            else:
+                if active_commands:
+                    last_command = active_commands.popleft()
+                    holding_last_command = False
+                elif last_command is not None and not holding_last_command:
+                    print(
+                        "[command] action horizon exhausted; holding the last command "
+                        "until the next chunk is ready",
+                        flush=True,
+                    )
+                    holding_last_command = True
             if last_command is not None:
                 if active_session is None:
                     raise RuntimeError("cannot publish a command without an active control session")
@@ -498,21 +701,42 @@ class DoubleBufferedPolicyRunner:
                     command_stream_started = True
                 command_sequence += 1
                 report_commands += 1
+            if control_enabled and active_session is not None:
+                with self._condition:
+                    if self._control_tick_session == active_session:
+                        self._control_tick += 1
             report_now = time.monotonic()
             report_elapsed = report_now - report_started_at
             if report_elapsed >= self.status_interval:
                 with self._condition:
                     observation_age = report_now - self._latest_observation_at
-                    inference_pending = self._pending_commands is not None
+                    ready_chunk_count = len(self._ready_chunks)
+                    inference_pending = (
+                        self._pending_commands is not None
+                        if self.execution_mode == "double_buffer"
+                        else bool(ready_chunk_count)
+                    )
                     latest = self._latest_observation
                     takeover_enabled = bool(latest and latest.takeover_enabled)
                     control_session = None if latest is None else latest.control_session
+                if self.execution_mode == "temporal_ensemble":
+                    mode_status = (
+                        f"control_tick={current_tick}, "
+                        f"ensemble_chunks={temporal_ensembler.active_chunk_count}, "
+                        f"ensemble_contributors={ensemble_contributors}, "
+                        f"ready_chunks={ready_chunk_count}"
+                    )
+                else:
+                    mode_status = (
+                        f"chunk_remaining={len(active_commands)}, "
+                        f"holding={holding_last_command}, "
+                        f"inference_chunk_pending={inference_pending}"
+                    )
                 print(
                     f"[command] rate={report_commands / report_elapsed:.1f}Hz, "
                     f"published={report_commands}, next_sequence={command_sequence}, "
                     f"subscriber_connected={self._command_subscriber_connected}, "
-                    f"chunk_remaining={len(active_commands)}, holding={holding_last_command}, "
-                    f"inference_chunk_pending={inference_pending}, "
+                    f"mode={self.execution_mode}, {mode_status}, "
                     f"observation_age={observation_age:.3f}s, "
                     f"takeover_enabled={takeover_enabled}, control_session={control_session}",
                     flush=True,
@@ -541,7 +765,19 @@ def parse_args():
     parser.add_argument("--command-endpoint", default="tcp://*:8559")
     parser.add_argument("--policy-host", default="127.0.0.1")
     parser.add_argument("--policy-port", type=int, default=5555)
+    parser.add_argument(
+        "--execution-mode",
+        choices=EXECUTION_MODES,
+        default="double_buffer",
+        help="Action execution strategy; rtc is reserved for a future implementation",
+    )
     parser.add_argument("--execution-horizon", type=int, default=8)
+    parser.add_argument(
+        "--temporal-ensemble-coeff",
+        type=float,
+        default=0.01,
+        help="ACT exponential weight coefficient; 0 gives an equal average",
+    )
     parser.add_argument("--command-fps", type=float, default=30.0)
     parser.add_argument("--observation-timeout", type=float, default=1.0)
     parser.add_argument("--status-interval", type=float, default=5.0)
@@ -555,6 +791,10 @@ def parse_args():
         parser.error("--observation-timeout must be positive")
     if args.status_interval <= 0:
         parser.error("--status-interval must be positive")
+    if not np.isfinite(args.temporal_ensemble_coeff):
+        parser.error("--temporal-ensemble-coeff must be finite")
+    if args.execution_mode == "rtc":
+        parser.error("--execution-mode rtc is reserved but not implemented yet")
     return args
 
 
@@ -562,7 +802,8 @@ def main():
     args = parse_args()
     print(
         f"Starting RoboJuDo deploy client: profile={args.profile}, "
-        f"observations={args.robot_endpoint}, commands={args.command_endpoint}",
+        f"mode={args.execution_mode}, observations={args.robot_endpoint}, "
+        f"commands={args.command_endpoint}",
         flush=True,
     )
     subscriber = ObservationSubscriber(args.robot_endpoint, args.profile)
@@ -577,6 +818,8 @@ def main():
         observation_timeout=args.observation_timeout,
         status_interval=args.status_interval,
         task_override=args.task,
+        execution_mode=args.execution_mode,
+        temporal_ensemble_coeff=args.temporal_ensemble_coeff,
     )
     try:
         runner.run()
