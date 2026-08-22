@@ -169,6 +169,40 @@ class TestGr00tPolicyGetAction:
         assert isinstance(action, dict)
         assert isinstance(info, dict)
 
+    def test_rtc_prefix_is_forwarded_as_processed_actions(self, policy):
+        obs = _make_observation()
+        prefix_actions = {
+            key: np.arange(4, dtype=np.float32).reshape(1, 4, 1) for key in ACTION_KEYS
+        }
+
+        _, info = policy.get_action(
+            obs,
+            options={
+                "rtc": {
+                    "prefix_actions": prefix_actions,
+                    "prefix_length": 4,
+                    "estimated_delay_steps": 2,
+                    "guidance_horizon": 4,
+                    "prefix_schedule": "exp",
+                    "max_guidance_weight": 10.0,
+                }
+            },
+        )
+
+        message = policy.processor.call_args.args[0][0]
+        for key in ACTION_KEYS:
+            processed_prefix = message["content"].actions[key]
+            assert processed_prefix.shape == (16, 1)
+            np.testing.assert_array_equal(processed_prefix[:4], prefix_actions[key][0])
+            np.testing.assert_array_equal(
+                processed_prefix[4:],
+                np.repeat(prefix_actions[key][0, -1:], 12, axis=0),
+            )
+        model_options = policy.model.get_action.call_args.kwargs["options"]
+        assert "prefix_actions" not in model_options["rtc"]
+        assert model_options["rtc"]["estimated_delay_steps"] == 2
+        assert info["rtc"] == model_options["rtc"]
+
 
 class _NumpyLanguageSimPolicy:
     def __init__(self):

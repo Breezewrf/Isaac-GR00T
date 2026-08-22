@@ -177,9 +177,32 @@ uv run python examples/RoboJuDo/run_robojudo_client.py \
 ```
 
 `--temporal-ensemble-coeff 0` gives a direct average. The ACT value `0.01` exponentially gives
-slightly more weight to older predictions. `--execution-mode rtc` is reserved in the CLI so RTC can
-be added without another interface change, but currently exits with an explicit not-implemented
-error rather than silently selecting a different scheduler.
+slightly more weight to older predictions.
+
+**Real-Time Chunking (RTC)** continuously infers while executing the current 16-step chunk. It
+re-anchors the unexecuted physical arm targets against the latest measured joints, sends that
+normalized prefix into the flow sampler, and replaces the queue after skipping the actual inference
+delay:
+
+```bash
+uv run python examples/RoboJuDo/run_robojudo_client.py \
+  --profile x2 \
+  --robot-endpoint tcp://127.0.0.1:8561 \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --command-endpoint tcp://*:8559 \
+  --execution-mode rtc \
+  --execution-horizon 8 \
+  --rtc-prefix-schedule exp \
+  --rtc-max-guidance-weight 10
+```
+
+In RTC mode, `--execution-horizon` is the end of the prefix guidance window, not the number of
+actions returned by the model; all 16 actions remain available to the queue. The estimated frozen
+prefix is based on the maximum of the last `--rtc-latency-window` inference times. The queue is
+ultimately sliced using the measured control-tick delay, so an inaccurate estimate changes guidance
+strength but does not cause already-expired actions to execute. Use `double_buffer` as the rollback
+mode while tuning RTC on hardware.
 
 Temporal Ensemble assigns each prediction to the command tick at which inference started. If a
 request made at tick 0 returns at tick 3, actions 0 through 2 have already expired and action 3 is

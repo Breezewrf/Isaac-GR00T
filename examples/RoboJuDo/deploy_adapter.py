@@ -18,6 +18,15 @@ class RobotProfile:
     arm_width: int
 
 
+@dataclass(frozen=True)
+class PolicyActionChunk:
+    """Physical policy actions together with their RoboJuDo command encoding."""
+
+    actions: dict[str, np.ndarray] # For RTC prefix guidance
+    commands: list[dict[str, Any]] # For loop execution
+    info: dict[str, Any]
+
+
 PROFILES = {
     "g1_23dof": RobotProfile(
         joint_names=(
@@ -105,9 +114,9 @@ class RoboJuDoPolicyAdapter:
             "language": {"task": [[instruction]]},
         }
 
-    def decode_action_chunk(
-        self, action_chunk: Mapping[str, np.ndarray], execution_horizon: int
-    ) -> list[dict[str, Any]]:
+    def _validate_action_chunk(
+        self, action_chunk: Mapping[str, np.ndarray]
+    ) -> tuple[dict[str, np.ndarray], int]:
         required = {
             "left_arm": self.profile.arm_width,
             "right_arm": self.profile.arm_width,
@@ -128,6 +137,12 @@ class RoboJuDoPolicyAdapter:
             arrays[key] = value
 
         available_horizon = min(value.shape[1] for value in arrays.values())
+        return arrays, available_horizon
+
+    def decode_action_chunk(
+        self, action_chunk: Mapping[str, np.ndarray], execution_horizon: int
+    ) -> list[dict[str, Any]]:
+        arrays, available_horizon = self._validate_action_chunk(action_chunk)
         if not 1 <= execution_horizon <= available_horizon:
             raise ValueError(
                 f"execution_horizon must be in [1, {available_horizon}], got {execution_horizon}"
@@ -154,6 +169,31 @@ class RoboJuDoPolicyAdapter:
             )
         return commands
 
+    def get_action_chunk(
+        self,
+        image: np.ndarray,
+        joint_positions: Mapping[str, float] | Sequence[float] | np.ndarray,
+        instruction: str,
+        *,
+        execution_horizon: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> PolicyActionChunk:
+        """Return the physical chunk and commands; RTC uses all available steps."""
+        observation = self.build_observation(image, joint_positions, instruction)
+
+        # Inference, pass the options to the Policy client
+        action_chunk, info = self.policy_client.get_action(observation, options=options)
+
+        arrays, available_horizon = self._validate_action_chunk(action_chunk)
+        # When using RTC, the execution_horizon is None, and we use all available steps.
+        horizon = available_horizon if execution_horizon is None else execution_horizon
+        actions = {key: value[:, :horizon].copy() for key, value in arrays.items()}
+        return PolicyActionChunk(
+            actions=actions,
+            commands=self.decode_action_chunk(actions, horizon),
+            info=info,
+        )
+
     def get_action(
         self,
         image: np.ndarray,
@@ -162,6 +202,9 @@ class RoboJuDoPolicyAdapter:
         *,
         execution_horizon: int = 8,
     ) -> list[dict[str, Any]]:
-        observation = self.build_observation(image, joint_positions, instruction)
-        action_chunk, _ = self.policy_client.get_action(observation)
-        return self.decode_action_chunk(action_chunk, execution_horizon)
+        return self.get_action_chunk(  # Only need the commands except for RTC, which uses get_action_chunk() to get the actions for prefix guidance
+            image,
+            joint_positions,
+            instruction,
+            execution_horizon=execution_horizon,
+        ).commands

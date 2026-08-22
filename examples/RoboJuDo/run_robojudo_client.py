@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import dataclass
+import math
 import threading
 import time
 
@@ -21,6 +22,8 @@ from zmq.utils.monitor import recv_monitor_message
 
 
 EXECUTION_MODES = ("double_buffer", "temporal_ensemble", "rtc")
+RTC_PREFIX_SCHEDULES = ("zeros", "ones", "linear", "exp")
+ROBOJUDO_ACTION_HORIZON = 16
 
 
 @dataclass(frozen=True)
@@ -41,8 +44,69 @@ class ActionChunk:
     observation_sequence: int
     observation_received_at: float
     inference_seconds: float
-    start_tick: int
+    start_tick: int  # The control tick at the start of inference
     commands: list[dict]
+    physical_actions: dict[str, np.ndarray] | None = None  # Provide Prefix action for RTC mode
+    task: str = ""
+    estimated_delay_steps: int = 0
+
+
+class RTCActionQueue:
+    """Lockstep physical-action/command queue; caller supplies synchronization."""
+
+    def __init__(self):
+        self._chunk: ActionChunk | None = None
+        self._next_index = 0  # Index of the next command and next physical action simultaneously
+
+    @property
+    def chunk(self) -> ActionChunk | None:
+        return self._chunk
+
+    def clear(self):
+        self._chunk = None
+        self._next_index = 0
+
+    def qsize(self) -> int:
+        if self._chunk is None:
+            return 0
+        return max(0, len(self._chunk.commands) - self._next_index)
+
+    def pop(self) -> dict | None:
+        if self._chunk is None or self._next_index >= len(self._chunk.commands):
+            return None
+        command = self._chunk.commands[self._next_index]
+        self._next_index += 1
+        return command
+
+    def get_left_over(self, session: tuple[str, int], task: str) -> dict[str, np.ndarray] | None:
+        # Get remaining physical action as prefix actions for RTC reference
+        chunk = self._chunk
+        if (
+            chunk is None
+            or chunk.physical_actions is None
+            or (chunk.stream_id, chunk.control_session) != session
+            or chunk.task != task
+            or self._next_index >= len(chunk.commands)
+        ):
+            return None
+        return {
+            key: value[:, self._next_index :].copy()
+            for key, value in chunk.physical_actions.items()
+        }
+
+    def replace(self, chunk: ActionChunk, skipped_steps: int) -> bool:
+        # Start at the skipped steps rather than the 0 of the chunk
+        if chunk.physical_actions is None:
+            raise ValueError("RTC action chunks must include physical_actions")
+        horizon = len(chunk.commands)
+        if any(value.shape[1] != horizon for value in chunk.physical_actions.values()):
+            raise ValueError("RTC physical actions and commands must have the same horizon")
+        if skipped_steps >= horizon:  # delay is too long, the chunk is expired
+            self.clear()
+            return False
+        self._chunk = chunk
+        self._next_index = max(0, skipped_steps)
+        return True
 
 
 @dataclass(frozen=True)
@@ -233,6 +297,9 @@ class DoubleBufferedPolicyRunner:
         task_override: str | None,
         execution_mode: str = "double_buffer",
         temporal_ensemble_coeff: float = 0.01,
+        rtc_prefix_schedule: str = "exp",
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_latency_window: int = 10,
     ):
         self.profile = profile
         self.policy_host = policy_host
@@ -245,6 +312,9 @@ class DoubleBufferedPolicyRunner:
         self.task_override = task_override
         self.execution_mode = execution_mode
         self.temporal_ensemble_coeff = temporal_ensemble_coeff
+        self.rtc_prefix_schedule = rtc_prefix_schedule
+        self.rtc_max_guidance_weight = rtc_max_guidance_weight
+        self.rtc_latency_window = rtc_latency_window
         # Coordinates observations, inference results, and the command-loop tick.
         self._condition = threading.Condition()
         self._stopping = False
@@ -254,6 +324,10 @@ class DoubleBufferedPolicyRunner:
         self._last_inferred_sequence = -1
         self._pending_commands: ActionChunk | None = None
         self._ready_chunks: deque[ActionChunk] = deque()
+        self._rtc_queue = RTCActionQueue()
+        # Store the last N inference latencies for RTC mode to estimate the delay steps
+        # e.g. D_est = cel(delay_ms/command_period_ms) = ceil(82 / 33.3) = 3 steps
+        self._rtc_inference_latencies: deque[float] = deque(maxlen=rtc_latency_window)
         self._control_tick = 0
         self._control_tick_session: tuple[str, int] | None = None
         self._error: Exception | None = None
@@ -376,7 +450,7 @@ class DoubleBufferedPolicyRunner:
                             or self._error is not None
                             or (
                                 (
-                                    self.execution_mode == "temporal_ensemble"
+                                    self.execution_mode in ("temporal_ensemble", "rtc")
                                     or self._pending_commands is None
                                 )
                                 and self._latest_observation is not None
@@ -406,26 +480,84 @@ class DoubleBufferedPolicyRunner:
                         if self._control_tick_session == observation_session
                         else 0
                     )
+
+                    # RTC mode: get prefix actions related(rtc_prefix, estimated_delay_steps) for RTC reference
+                    instruction = self.task_override or observation.task
+                    rtc_prefix = None
+                    prefix_length = 0
+                    estimated_delay_steps = 0
+                    if self.execution_mode == "rtc":
+                        rtc_prefix = self._rtc_queue.get_left_over(observation_session, instruction)
+                        if rtc_prefix is not None:
+                            prefix_length = min(value.shape[1] for value in rtc_prefix.values())  # L
+                            if self._rtc_inference_latencies:
+                                estimated_delay_steps = math.ceil(
+                                    max(self._rtc_inference_latencies) / self.command_period
+                                )
+                            estimated_delay_steps = min(  # D_est
+                                estimated_delay_steps,
+                                prefix_length,
+                                self.execution_horizon,
+                            )
+
                     self._last_inferred_session = observation_session
                     self._last_inferred_sequence = observation.sequence
                 inference_started_at = time.monotonic()
-                commands = adapter.get_action(
-                    image=observation.image,
-                    joint_positions=observation.joint_positions,
-                    instruction=self.task_override or observation.task,
-                    execution_horizon=self.execution_horizon,
-                )
+
+                # Construct RTC options and start inference
+                physical_actions = None
+                if self.execution_mode == "rtc":
+                    rtc_options = None
+                    if rtc_prefix is not None:
+                        rtc_options = {
+                            "rtc": {
+                                "prefix_actions": rtc_prefix,
+                                "prefix_length": prefix_length,  # L, Remaining prefix length of old action
+                                "estimated_delay_steps": estimated_delay_steps, # D_est
+                                "guidance_horizon": min(self.execution_horizon, prefix_length),  # H, execution_horizon is the max guidance horizon for RTC
+                                "prefix_schedule": self.rtc_prefix_schedule,
+                                "max_guidance_weight": self.rtc_max_guidance_weight,
+                            }
+                        }
+                    policy_chunk = adapter.get_action_chunk(
+                        image=observation.image,
+                        joint_positions=observation.joint_positions,
+                        instruction=instruction,
+                        execution_horizon=None,
+                        options=rtc_options,
+                    )
+                    commands = policy_chunk.commands
+                    physical_actions = policy_chunk.actions
+                else:
+                    commands = adapter.get_action(
+                        image=observation.image,
+                        joint_positions=observation.joint_positions,
+                        instruction=instruction,
+                        execution_horizon=self.execution_horizon,
+                    )
                 if not commands:
                     raise ValueError(
                         f"GR00T returned an empty action chunk for observation {observation.sequence}"
                     )
                 inference_seconds = time.monotonic() - inference_started_at
                 with self._condition:
+                    # After Inference, check if the observation is still valid for the current session and task
+                    if self.execution_mode == "rtc":
+                        self._rtc_inference_latencies.append(inference_seconds)
                     latest = self._latest_observation
+                    latest_instruction = (
+                        None if latest is None else self.task_override or latest.task
+                    )
                     if (
                         latest is None
                         or not latest.takeover_enabled
                         or (latest.stream_id, latest.control_session) != observation_session
+                        or latest_instruction != instruction
+                        or (
+                            self.execution_mode == "rtc"
+                            and time.monotonic() - self._latest_observation_at
+                            > self.observation_timeout
+                        )
                     ):
                         print(
                             f"[inference] discarded chunk from inactive session "
@@ -442,23 +574,37 @@ class DoubleBufferedPolicyRunner:
                         inference_seconds=inference_seconds,
                         start_tick=query_tick,
                         commands=commands,
+                        physical_actions=physical_actions,
+                        task=instruction,
+                        estimated_delay_steps=estimated_delay_steps,
                     )
                     ready_tick = (
                         self._control_tick
                         if self._control_tick_session == observation_session
                         else query_tick
                     )
+                    skipped_steps = max(0, ready_tick - query_tick) if rtc_prefix is not None else 0  # D_actual
                     if self.execution_mode == "temporal_ensemble":
                         self._ready_chunks.append(chunk)
+                    elif self.execution_mode == "rtc":
+                        activated = self._rtc_queue.replace(chunk, skipped_steps)  # Skipped the expired steps due to the inference delay
+                        if not activated:
+                            print(
+                                f"[inference] RTC chunk expired before activation: "
+                                f"actual_delay={skipped_steps}, horizon={len(commands)}; "
+                                "waiting for an unguided refresh",
+                                flush=True,
+                            )
                     else:
                         self._pending_commands = chunk
                     self._condition.notify_all()
-                skipped_steps = max(0, ready_tick - query_tick)
                 print(
                     f"[inference] chunk ready: observation_sequence={observation.sequence}, "
                     f"session={observation.control_session}, actions={len(commands)}, "
                     f"latency={inference_seconds:.3f}s, query_tick={query_tick}, "
-                    f"ready_tick={ready_tick}, skipped_steps={skipped_steps}",
+                    f"ready_tick={ready_tick}, skipped_steps={skipped_steps}, "
+                    f"rtc_prefix={prefix_length}, "
+                    f"rtc_estimated_delay={estimated_delay_steps}",
                     flush=True,
                 )
         except Exception as exc:
@@ -503,6 +649,7 @@ class DoubleBufferedPolicyRunner:
         observation_was_fresh = False
         control_was_enabled = False
         active_session: tuple[str, int] | None = None
+        active_task: str | None = None
         holding_last_command = False
         report_started_at = time.monotonic()
         report_commands = 0
@@ -511,6 +658,7 @@ class DoubleBufferedPolicyRunner:
         while True:
             self._poll_command_subscriber()
             ready_chunks = []
+            rtc_command = None
             current_tick = 0
             with self._condition:
                 if self._error is not None:
@@ -524,6 +672,9 @@ class DoubleBufferedPolicyRunner:
                 current_session = (
                     (latest.stream_id, latest.control_session) if latest is not None else None
                 )
+                current_task = None if latest is None else self.task_override or latest.task
+
+                # Handle observation timeout, control takeover, and session/task changes
                 if not observation_fresh:
                     if observation_was_fresh:
                         print(
@@ -533,12 +684,15 @@ class DoubleBufferedPolicyRunner:
                     last_command = None
                     self._pending_commands = None
                     self._ready_chunks.clear()
+                    self._rtc_queue.clear()
+                    self._rtc_inference_latencies.clear()
                     if temporal_ensembler is not None:
                         temporal_ensembler.reset()
                     self._control_tick = 0
                     self._control_tick_session = None
                     holding_last_command = False
                     active_session = None
+                    active_task = None
                 elif not observation_was_fresh:
                     print("RoboJuDo observation stream is fresh", flush=True)
                 if observation_fresh and not control_enabled:
@@ -552,23 +706,37 @@ class DoubleBufferedPolicyRunner:
                     last_command = None
                     self._pending_commands = None
                     self._ready_chunks.clear()
+                    self._rtc_queue.clear()
+                    self._rtc_inference_latencies.clear()
                     if temporal_ensembler is not None:
                         temporal_ensembler.reset()
                     self._control_tick = 0
                     self._control_tick_session = None
                     holding_last_command = False
                     active_session = None
+                    active_task = None
                     if control_was_enabled or cleared_pending:
                         self._condition.notify_all()
-                elif control_enabled and current_session != active_session:
+                elif control_enabled and (
+                    current_session != active_session or current_task != active_task
+                ):
                     active_commands.clear()
                     last_command = None
                     holding_last_command = False
                     active_session = current_session
+                    active_task = current_task
                     self._control_tick = 0
                     self._control_tick_session = current_session
                     if temporal_ensembler is not None:
                         temporal_ensembler.reset()
+                    rtc_chunk = self._rtc_queue.chunk
+                    if (
+                        rtc_chunk is None
+                        or (rtc_chunk.stream_id, rtc_chunk.control_session) != current_session
+                        or rtc_chunk.task != current_task
+                    ):
+                        self._rtc_queue.clear()
+                        self._rtc_inference_latencies.clear()
                     pending_session = (
                         (
                             self._pending_commands.stream_id,
@@ -643,6 +811,9 @@ class DoubleBufferedPolicyRunner:
                                 flush=True,
                             )
                     current_tick = self._control_tick
+                if self.execution_mode == "rtc" and control_enabled:
+                    rtc_command = self._rtc_queue.pop()
+                    current_tick = self._control_tick
                 observation_was_fresh = observation_fresh
                 control_was_enabled = control_enabled
             if self.execution_mode == "temporal_ensemble":
@@ -665,6 +836,19 @@ class DoubleBufferedPolicyRunner:
                     if not holding_last_command:
                         print(
                             "[command] Temporal Ensemble horizon exhausted; holding arm/height "
+                            "and setting vx/vy/yaw_rate to zero",
+                            flush=True,
+                        )
+                    last_command = make_safe_hold_command(last_command)
+                    holding_last_command = True
+            elif self.execution_mode == "rtc":
+                if rtc_command is not None:
+                    last_command = rtc_command
+                    holding_last_command = False
+                elif last_command is not None:
+                    if not holding_last_command:
+                        print(
+                            "[command] RTC queue exhausted; holding arm/height "
                             "and setting vx/vy/yaw_rate to zero",
                             flush=True,
                         )
@@ -719,12 +903,19 @@ class DoubleBufferedPolicyRunner:
                     latest = self._latest_observation
                     takeover_enabled = bool(latest and latest.takeover_enabled)
                     control_session = None if latest is None else latest.control_session
+                    rtc_queue_size = self._rtc_queue.qsize()
                 if self.execution_mode == "temporal_ensemble":
                     mode_status = (
                         f"control_tick={current_tick}, "
                         f"ensemble_chunks={temporal_ensembler.active_chunk_count}, "
                         f"ensemble_contributors={ensemble_contributors}, "
                         f"ready_chunks={ready_chunk_count}"
+                    )
+                elif self.execution_mode == "rtc":
+                    mode_status = (
+                        f"control_tick={current_tick}, rtc_queue_remaining={rtc_queue_size}, "
+                        f"holding={holding_last_command}, "
+                        f"latency_samples={len(self._rtc_inference_latencies)}"
                     )
                 else:
                     mode_status = (
@@ -769,7 +960,7 @@ def parse_args():
         "--execution-mode",
         choices=EXECUTION_MODES,
         default="double_buffer",
-        help="Action execution strategy; rtc is reserved for a future implementation",
+        help="Action execution strategy; RTC continuously replaces a guided action queue",
     )
     parser.add_argument("--execution-horizon", type=int, default=8)
     parser.add_argument(
@@ -778,13 +969,31 @@ def parse_args():
         default=0.01,
         help="ACT exponential weight coefficient; 0 gives an equal average",
     )
+    parser.add_argument(
+        "--rtc-prefix-schedule",
+        choices=RTC_PREFIX_SCHEDULES,
+        default="exp",
+        help="RTC prefix attention schedule between estimated delay and execution horizon",
+    )
+    parser.add_argument(
+        "--rtc-max-guidance-weight",
+        type=float,
+        default=10.0,
+        help="Maximum per-denoising-step RTC correction gain",
+    )
+    parser.add_argument(
+        "--rtc-latency-window",
+        type=int,
+        default=10,
+        help="Number of recent inference latencies used by RTC's rolling maximum",
+    )
     parser.add_argument("--command-fps", type=float, default=30.0)
     parser.add_argument("--observation-timeout", type=float, default=1.0)
     parser.add_argument("--status-interval", type=float, default=5.0)
     parser.add_argument("--task", default=None, help="Override the task sent by RoboJuDo")
     args = parser.parse_args()
-    if args.execution_horizon <= 0:
-        parser.error("--execution-horizon must be positive")
+    if not 1 <= args.execution_horizon <= ROBOJUDO_ACTION_HORIZON:
+        parser.error(f"--execution-horizon must be in [1, {ROBOJUDO_ACTION_HORIZON}]")
     if args.command_fps <= 0:
         parser.error("--command-fps must be positive")
     if args.observation_timeout <= 0:
@@ -793,8 +1002,10 @@ def parse_args():
         parser.error("--status-interval must be positive")
     if not np.isfinite(args.temporal_ensemble_coeff):
         parser.error("--temporal-ensemble-coeff must be finite")
-    if args.execution_mode == "rtc":
-        parser.error("--execution-mode rtc is reserved but not implemented yet")
+    if not np.isfinite(args.rtc_max_guidance_weight) or args.rtc_max_guidance_weight < 0:
+        parser.error("--rtc-max-guidance-weight must be finite and non-negative")
+    if args.rtc_latency_window <= 0:
+        parser.error("--rtc-latency-window must be positive")
     return args
 
 
@@ -820,6 +1031,9 @@ def main():
         task_override=args.task,
         execution_mode=args.execution_mode,
         temporal_ensemble_coeff=args.temporal_ensemble_coeff,
+        rtc_prefix_schedule=args.rtc_prefix_schedule,
+        rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+        rtc_latency_window=args.rtc_latency_window,
     )
     try:
         runner.run()

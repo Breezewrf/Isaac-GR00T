@@ -23,7 +23,11 @@ and feed it synthetic backbone output tensors.
 import math
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
-from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
+from gr00t.model.gr00t_n1d7.gr00t_n1d7 import (
+    Gr00tN1d7ActionHead,
+    get_rtc_guidance_weight,
+    get_rtc_prefix_weights,
+)
 import pytest
 import torch
 from transformers.feature_extraction_utils import BatchFeature
@@ -151,6 +155,59 @@ class TestActionHeadGetAction:
             action_input,
         )
         assert out["action_pred"].shape[0] == 1
+
+    def test_rtc_zero_guidance_matches_ordinary_sampling(self, action_head):
+        head, config = action_head
+        backbone_output = _make_backbone_output(config, batch_size=1)
+        ordinary_input = _make_action_input(config, batch_size=1)
+        del ordinary_input["action"]
+        del ordinary_input["action_mask"]
+        rtc_input = BatchFeature(
+            data={
+                "state": ordinary_input["state"].clone(),
+                "embodiment_id": ordinary_input["embodiment_id"].clone(),
+                "action": torch.randn(1, config.action_horizon, config.max_action_dim),
+                "action_mask": torch.ones(1, config.action_horizon, config.max_action_dim),
+            }
+        )
+
+        torch.manual_seed(123)
+        ordinary = head.get_action(backbone_output, ordinary_input)["action_pred"]
+
+        torch.manual_seed(123)
+        guided = head.get_action(
+            backbone_output,
+            rtc_input,
+            options={
+                "rtc": {
+                    "prefix_length": config.action_horizon,
+                    "estimated_delay_steps": 1,
+                    "guidance_horizon": 3,
+                    "prefix_schedule": "exp",
+                    "max_guidance_weight": 0.0,
+                }
+            },
+        )["action_pred"]
+
+        torch.testing.assert_close(guided, ordinary)
+        assert not guided.requires_grad
+
+
+class TestRTCUtilities:
+    def test_prefix_weights_have_frozen_transition_and_free_regions(self):
+        weights = get_rtc_prefix_weights(2, 5, 8, "exp")
+
+        torch.testing.assert_close(weights[:2], torch.ones(2))
+        assert torch.all(weights[2:5] < 1.0)
+        assert torch.all(weights[2:5] > 0.0)
+        assert torch.all(weights[2:4] > weights[3:5])
+        torch.testing.assert_close(weights[5:], torch.zeros(3))
+
+    def test_guidance_weight_is_capped_at_flow_boundaries(self):
+        device = torch.device("cpu")
+        assert get_rtc_guidance_weight(0.0, 10.0, device=device).item() == 10.0
+        assert get_rtc_guidance_weight(1.0, 10.0, device=device).item() == 10.0
+        assert get_rtc_guidance_weight(0.5, 10.0, device=device).item() == 2.0
 
 
 class TestActionHeadEncodeFeatures:

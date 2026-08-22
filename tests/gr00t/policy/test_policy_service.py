@@ -37,8 +37,10 @@ class MockPolicy:
     def __init__(self):
         self.strict = False
         self._reset_count = 0
+        self.last_options = None
 
     def get_action(self, observation, options=None):
+        self.last_options = options
         # Echo back a dummy action dict derived from observation keys
         action = {"joint_pos": np.zeros(7, dtype=np.float32)}
         info = {"mock": True}
@@ -106,12 +108,22 @@ class TestPolicyServerClient:
         assert client.ping() is True
 
     def test_get_action_roundtrip(self, server_client):
-        client, _, _ = server_client
+        client, _, policy = server_client
         obs = {"state": {"joint_pos": np.zeros(7, dtype=np.float32)}}
-        result = client.call_endpoint("get_action", {"observation": obs})
+        options = {
+            "rtc": {
+                "prefix_actions": {"joint_pos": np.ones((1, 4, 7), dtype=np.float32)},
+                "prefix_length": 4,
+            }
+        }
+        result = client.get_action(obs, options=options)
         action, info = result
         assert "joint_pos" in action
         np.testing.assert_array_equal(action["joint_pos"], np.zeros(7, dtype=np.float32))
+        np.testing.assert_array_equal(
+            policy.last_options["rtc"]["prefix_actions"]["joint_pos"],
+            options["rtc"]["prefix_actions"]["joint_pos"],
+        )
 
     def test_reset(self, server_client):
         client, _, policy = server_client
