@@ -197,7 +197,11 @@ class Gr00tPolicy(BasePolicy):
             unbatched_obs.append(unbatched_value)
         return unbatched_obs
 
-    def _to_vla_step_data(self, observation: dict[str, Any]) -> VLAStepData:
+    def _to_vla_step_data(
+        self,
+        observation: dict[str, Any],
+        actions: dict[str, np.ndarray] | None = None,
+    ) -> VLAStepData:
         """Convert a single observation into a VLAStepData object for processing.
 
         Args:
@@ -209,10 +213,108 @@ class Gr00tPolicy(BasePolicy):
         return VLAStepData(
             images=observation["video"],
             states=observation["state"],
-            actions={},  # No ground truth actions during inference
+            actions={} if actions is None else actions,
             text=observation["language"][self.language_key][0],
             embodiment=self.embodiment_tag,
         )
+
+    def _prepare_rtc_options(
+        self,
+        options: dict[str, Any] | None,
+        batch_size: int,
+    ) -> tuple[list[dict[str, np.ndarray]] | None, dict[str, Any] | None]:
+        """Validate physical RTC prefixes and strip them from model options."""
+        if options is None or options.get("rtc") is None:
+            return None, options
+        if batch_size != 1:
+            raise ValueError("RTC currently supports batch size 1 only")
+        rtc = options["rtc"]
+        if not isinstance(rtc, dict):
+            raise ValueError("options['rtc'] must be a dictionary")
+
+        prefix_actions = rtc.get("prefix_actions")
+        if not isinstance(prefix_actions, dict):
+            raise ValueError("RTC prefix_actions must be a dictionary")
+        action_keys = self.modality_configs["action"].modality_keys
+        missing = [key for key in action_keys if key not in prefix_actions]
+        if missing:
+            raise ValueError(f"RTC prefix_actions is missing action groups: {missing}")
+
+        prefix_length = rtc.get("prefix_length")
+        if isinstance(prefix_length, bool) or not isinstance(prefix_length, int):
+            raise ValueError("RTC prefix_length must be an integer")
+        action_horizon = len(self.modality_configs["action"].delta_indices)
+        if not 1 <= prefix_length <= action_horizon:
+            raise ValueError(
+                f"RTC prefix_length must be in [1, {action_horizon}], got {prefix_length}"
+            )
+
+        per_sample_actions: dict[str, np.ndarray] = {}
+        for key in action_keys:
+            value = np.asarray(prefix_actions[key])
+            if value.dtype != np.float32:
+                raise ValueError(f"RTC prefix action {key!r} must have dtype float32")
+            if value.ndim != 3 or value.shape[0] != batch_size:
+                raise ValueError(
+                    f"RTC prefix action {key!r} must have shape (1, T, D), got {value.shape}"
+                )
+            if value.shape[1] < prefix_length:
+                raise ValueError(
+                    f"RTC prefix action {key!r} has only {value.shape[1]} steps, "
+                    f"expected at least {prefix_length}"
+                )
+            if not np.isfinite(value).all():
+                raise ValueError(f"RTC prefix action {key!r} contains non-finite values")
+            action = value[0, :prefix_length].copy()
+            # Some checkpoints store per-timestep action statistics with shape
+            # (action_horizon, action_dim). StateActionProcessor therefore expects a
+            # full-horizon array even when RTC only has a shorter leftover prefix.
+            # Repeat the final physical target for normalization; the sampler still
+            # uses prefix_length/guidance_horizon to mask every padded timestep.
+            if prefix_length < action_horizon:
+                padding = np.repeat(
+                    action[-1:],
+                    action_horizon - prefix_length,
+                    axis=0,
+                )
+                action = np.concatenate((action, padding), axis=0)
+            per_sample_actions[key] = action
+
+        estimated_delay = rtc.get("estimated_delay_steps")
+        guidance_horizon = rtc.get("guidance_horizon")
+        for name, value in (
+            ("estimated_delay_steps", estimated_delay),
+            ("guidance_horizon", guidance_horizon),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"RTC {name} must be an integer")
+        if not 0 <= estimated_delay <= guidance_horizon <= action_horizon:
+            raise ValueError(
+                "RTC horizons must satisfy 0 <= estimated_delay_steps <= "
+                f"guidance_horizon <= {action_horizon}"
+            )
+        prefix_schedule = rtc.get("prefix_schedule", "exp")
+        if prefix_schedule not in ("zeros", "ones", "linear", "exp"):
+            raise ValueError(f"Unsupported RTC prefix_schedule {prefix_schedule!r}")
+        max_guidance_weight = rtc.get("max_guidance_weight", 10.0)
+        if (
+            isinstance(max_guidance_weight, bool)
+            or not isinstance(max_guidance_weight, (int, float))
+            or not np.isfinite(max_guidance_weight)
+            or max_guidance_weight < 0
+        ):
+            raise ValueError("RTC max_guidance_weight must be finite and non-negative")
+
+        model_rtc = {
+            "prefix_length": prefix_length,
+            "estimated_delay_steps": min(estimated_delay, prefix_length),
+            "guidance_horizon": min(guidance_horizon, prefix_length),
+            "prefix_schedule": prefix_schedule,
+            "max_guidance_weight": float(max_guidance_weight),
+        }
+        model_options = {key: value for key, value in options.items() if key != "rtc"}
+        model_options["rtc"] = model_rtc
+        return [per_sample_actions], model_options
 
     def check_observation(self, observation: dict[str, Any]) -> None:
         """Validate that the observation has the correct structure and types.
@@ -391,19 +493,21 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional inference parameters, including an RTC physical action prefix
 
         Returns:
             Tuple of (actions_dict, info_dict)
         """
         # Step 1: Split batched observation into individual observations
         unbatched_observations = self._unbatch_observation(observation)
+        rtc_actions, model_options = self._prepare_rtc_options(options, len(unbatched_observations))
         processed_inputs = []
 
         # Step 2: Process each observation through the VLA processor
         states = []
-        for obs in unbatched_observations:
-            vla_step_data = self._to_vla_step_data(obs)
+        for index, obs in enumerate(unbatched_observations):
+            actions = None if rtc_actions is None else rtc_actions[index]
+            vla_step_data = self._to_vla_step_data(obs, actions)
             states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
@@ -413,8 +517,14 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
         # Step 4: Run model inference to predict actions
-        with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+        if rtc_actions is None:
+            with torch.inference_mode():
+                model_pred = self.model.get_action(**collated_inputs, options=model_options)
+        else:
+            # torch.inference_mode() cannot be locally overridden by the RTC autograd
+            # correction. no_grad() can, while still keeping the rest of inference cheap.
+            with torch.no_grad():
+                model_pred = self.model.get_action(**collated_inputs, options=model_options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -429,7 +539,10 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        info = {}
+        if rtc_actions is not None:
+            info["rtc"] = model_options["rtc"]
+        return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import math
 from typing import Any, Tuple
 
 import torch
@@ -33,6 +34,72 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
 
 
 logger = logging.getLogger(__name__)
+
+
+RTC_PREFIX_SCHEDULES = ("zeros", "ones", "linear", "exp")
+
+
+def get_rtc_prefix_weights(
+    frozen_steps: int,
+    guidance_horizon: int,
+    total_steps: int,
+    schedule: str,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build LeRobot-compatible RTC prefix weights for one action chunk."""
+    if schedule not in RTC_PREFIX_SCHEDULES:
+        raise ValueError(
+            f"RTC prefix schedule must be one of {RTC_PREFIX_SCHEDULES}, got {schedule!r}"
+        )
+    if total_steps <= 0:
+        raise ValueError("RTC total_steps must be positive")
+    if not 0 <= frozen_steps <= guidance_horizon <= total_steps:
+        raise ValueError(
+            "RTC horizons must satisfy "
+            f"0 <= frozen_steps <= guidance_horizon <= total_steps, got "
+            f"{frozen_steps}, {guidance_horizon}, {total_steps}"
+        )
+
+    weights = torch.zeros(total_steps, device=device, dtype=dtype)
+    if schedule == "ones":
+        weights[:guidance_horizon] = 1.0
+        return weights
+    weights[:frozen_steps] = 1.0
+    if schedule == "zeros" or guidance_horizon == frozen_steps:
+        return weights
+
+    transition_steps = guidance_horizon - frozen_steps
+    transition = torch.linspace(
+        1.0,
+        0.0,
+        transition_steps + 2,
+        device=device,
+        dtype=dtype,
+    )[1:-1]
+    if schedule == "exp":
+        transition = transition * torch.expm1(transition) / math.expm1(1.0)
+    weights[frozen_steps:guidance_horizon] = transition
+    return weights
+
+
+def get_rtc_guidance_weight(
+    flow_time: float, max_guidance_weight: float, *, device: torch.device
+) -> torch.Tensor:
+    """Translate LeRobot's reverse-time RTC gain to GR00T's 0->1 flow time."""
+    if not 0.0 <= flow_time <= 1.0:
+        raise ValueError(f"RTC flow_time must be in [0, 1], got {flow_time}")
+    if not math.isfinite(max_guidance_weight) or max_guidance_weight < 0.0:
+        raise ValueError("RTC max_guidance_weight must be finite and non-negative")
+    progress = torch.as_tensor(flow_time, dtype=torch.float32, device=device)
+    remaining = 1.0 - progress
+    gain = (remaining.square() + progress.square()) / (remaining * progress)
+    return torch.nan_to_num(
+        gain,
+        nan=max_guidance_weight,
+        posinf=max_guidance_weight,
+    ).clamp(max=max_guidance_weight)
 
 
 class Gr00tN1d7ActionHead(nn.Module):
@@ -354,8 +421,41 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
+        rtc_options = options.get("rtc") if options is not None else None
+        rtc_prefix = None
+        rtc_weights = None
 
-        if "action" in action_input:
+        if rtc_options is not None:
+            if "action" not in action_input:
+                raise ValueError("RTC requires a normalized action prefix")
+            prefix_length = int(rtc_options["prefix_length"])
+            frozen_steps = min(int(rtc_options["estimated_delay_steps"]), prefix_length)
+            guidance_horizon = min(int(rtc_options["guidance_horizon"]), prefix_length)
+            if not 0 < prefix_length <= self.action_horizon:
+                raise ValueError(
+                    f"RTC prefix_length must be in [1, {self.action_horizon}], got {prefix_length}"
+                )
+            if not 0 <= frozen_steps <= guidance_horizon:
+                raise ValueError(
+                    "RTC horizons must satisfy 0 <= estimated_delay_steps <= "
+                    "guidance_horizon after prefix clipping"
+                )
+            rtc_prefix = action_input["action"][:, : self.action_horizon].detach()
+            prefix_weights = get_rtc_prefix_weights(
+                frozen_steps,
+                guidance_horizon,
+                self.action_horizon,
+                str(rtc_options.get("prefix_schedule", "exp")),
+                device=device,
+                dtype=actions.dtype,
+            )
+            rtc_weights = prefix_weights[None, :, None]
+            if "action_mask" in action_input:
+                rtc_weights = rtc_weights * action_input["action_mask"][
+                    :, : self.action_horizon
+                ].to(dtype=actions.dtype)
+
+        elif "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
             # action_horizon is the action horizon of the input action.
             # rtc_overlap_steps is the number of steps to overlap with the previous action chunks.
@@ -393,26 +493,13 @@ class Gr00tN1d7ActionHead(nn.Module):
                 :,
             ] = ramp[None, :, None].to(device)
 
-        # Run denoising steps.
-        for t in range(self.num_inference_timesteps):
-            t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
-            t_discretized = int(t_cont * self.num_timestep_buckets)
-
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
-            )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Add position embedding.
+        def predict_velocity(current_actions: torch.Tensor, timesteps_tensor: torch.Tensor):
+            """Run one denoising network evaluation."""
+            action_features = self.action_encoder(current_actions, timesteps_tensor, embodiment_id)
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
-
-            # Join vision, language, state and action embedding along sequence dimension.
+                action_features = action_features + self.position_embedding(pos_ids).unsqueeze(0)
             sa_embs = torch.cat((state_features, action_features), dim=1)
-
-            # Run model forward.
             if self.config.use_alternate_vl_dit:
                 model_output = self.model(
                     hidden_states=sa_embs,
@@ -428,11 +515,40 @@ class Gr00tN1d7ActionHead(nn.Module):
                     timestep=timesteps_tensor,
                 )
             pred = self.action_decoder(model_output, embodiment_id)
+            return pred[:, -self.action_horizon :]
 
-            pred_velocity = pred[:, -self.action_horizon :]
+        # Run denoising steps.
+        for t in range(self.num_inference_timesteps):
+            t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
+            t_discretized = int(t_cont * self.num_timestep_buckets)
+
+            timesteps_tensor = torch.full(
+                size=(batch_size,), fill_value=t_discretized, device=device
+            )
+            pred_velocity = predict_velocity(actions, timesteps_tensor)
+
+            if rtc_prefix is not None:
+                max_guidance_weight = float(rtc_options.get("max_guidance_weight", 10.0))
+                # LeRobot intentionally treats the denoiser output as fixed while taking
+                # this gradient. This computes the same vector-Jacobian correction without
+                # retaining a graph through the denoising network.
+                with torch.enable_grad():
+                    differentiable_actions = actions.detach().requires_grad_(True)
+                    clean_actions = differentiable_actions + (1.0 - t_cont) * pred_velocity
+                    prefix_error = (rtc_prefix - clean_actions) * rtc_weights
+                    correction = torch.autograd.grad(
+                        clean_actions,
+                        differentiable_actions,
+                        grad_outputs=prefix_error.detach(),
+                        retain_graph=False,
+                    )[0]
+                guidance_weight = get_rtc_guidance_weight(
+                    t_cont, max_guidance_weight, device=device
+                ).to(dtype=pred_velocity.dtype)
+                pred_velocity = pred_velocity + guidance_weight * correction
 
             # Update actions using euler integration.
-            actions = actions + dt * pred_velocity * vel_strength
+            actions = (actions + dt * pred_velocity * vel_strength).detach()
 
         return BatchFeature(
             data={
