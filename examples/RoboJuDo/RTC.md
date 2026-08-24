@@ -41,7 +41,8 @@ uv run python examples/RoboJuDo/run_robojudo_client.py \
 
 RTC 参数：
 
-- `--execution-horizon`：RTC guidance 结束位置 `H`，默认 8；模型仍生成并排队完整 16 步。
+- `--execution-horizon`：RTC guidance 结束位置 `H`，默认 8；模型仍生成并排队 checkpoint
+  定义的完整 action chunk。客户端会从第一次 policy 返回动态读取 action horizon。
 - `--rtc-prefix-schedule`：`zeros`、`ones`、`linear` 或 `exp`，默认 `exp`。
 - `--rtc-max-guidance-weight`：denoising correction 最大增益，默认 10。
 - `--rtc-latency-window`：估计延迟时保留的最近推理耗时数量，默认 10。
@@ -143,8 +144,9 @@ commands
 - `get_action_chunk()` 将 RTC options 传给 `PolicyClient.get_action()`，并返回完整物理 chunk。
 - 原来的 `get_action()` 保留，内部调用 `get_action_chunk()` 后只返回 commands，供其他 execution mode 使用。
 
-RTC 调用 `get_action_chunk(execution_horizon=None)`，因此保存模型返回的全部 16 步，而不是只截取
-`--execution-horizon` 步。
+RTC 调用 `get_action_chunk(execution_horizon=None)`，因此保存模型返回的完整 chunk，而不是只截取
+`--execution-horizon` 步。chunk 长度来自 checkpoint 对应 embodiment 的 action
+`delta_indices`，客户端不再将其固定为 16。
 
 ### `examples/RoboJuDo/run_robojudo_client.py`
 
@@ -570,7 +572,8 @@ rtc_prefix=16, rtc_estimated_delay=6
 - warm-up 推理通常比稳态慢，rolling maximum 可能让最初几轮 `D_est` 偏大，这是保守行为。
 - `D_est` 偏大只会让更多 prefix step 被强约束；实际队列切片始终使用 `D_actual`。
 - 如果动作过于依赖旧轨迹，可减小 `--execution-horizon` 或降低 `--rtc-max-guidance-weight`。
-- 如果 chunk 边界仍明显，可增大 `--execution-horizon`，但不能超过当前 action horizon 16。
+- 如果 chunk 边界仍明显，可增大 `--execution-horizon`，但不能超过客户端从 policy 首个 chunk
+  动态读取到的 action horizon。
 - 实机调参期间可随时切回 `--execution-mode double_buffer` 作为回滚模式。
 
 建议重点观察：
@@ -594,4 +597,3 @@ rtc_prefix=16, rtc_estimated_delay=6
 - 推理线程发送 leftover prefix，并按实际 tick 跳过新 chunk。
 - PolicyClient/PolicyServer 对包含 NumPy prefix 的 RTC options 往返传输。
 - `double_buffer` 和 `temporal_ensemble` 相关回归行为。
-

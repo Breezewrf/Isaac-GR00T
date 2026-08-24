@@ -23,7 +23,6 @@ from zmq.utils.monitor import recv_monitor_message
 
 EXECUTION_MODES = ("double_buffer", "temporal_ensemble", "rtc")
 RTC_PREFIX_SCHEDULES = ("zeros", "ones", "linear", "exp")
-ROBOJUDO_ACTION_HORIZON = 16
 
 
 @dataclass(frozen=True)
@@ -315,6 +314,9 @@ class DoubleBufferedPolicyRunner:
         self.rtc_prefix_schedule = rtc_prefix_schedule
         self.rtc_max_guidance_weight = rtc_max_guidance_weight
         self.rtc_latency_window = rtc_latency_window
+        # Learned from the first full chunk returned by the policy. The action
+        # horizon belongs to the checkpoint/embodiment, not to RoboJuDo.
+        self._policy_action_horizon: int | None = None
         # Coordinates observations, inference results, and the command-loop tick.
         self._condition = threading.Condition()
         self._stopping = False
@@ -489,7 +491,9 @@ class DoubleBufferedPolicyRunner:
                     if self.execution_mode == "rtc":
                         rtc_prefix = self._rtc_queue.get_left_over(observation_session, instruction)
                         if rtc_prefix is not None:
-                            prefix_length = min(value.shape[1] for value in rtc_prefix.values())  # L
+                            prefix_length = min(
+                                value.shape[1] for value in rtc_prefix.values()
+                            )  # L
                             if self._rtc_inference_latencies:
                                 estimated_delay_steps = math.ceil(
                                     max(self._rtc_inference_latencies) / self.command_period
@@ -504,7 +508,9 @@ class DoubleBufferedPolicyRunner:
                     self._last_inferred_sequence = observation.sequence
                 inference_started_at = time.monotonic()
 
-                # Construct RTC options and start inference
+                # Construct RTC options and start inference. Always request the
+                # complete policy chunk so its checkpoint-defined horizon can be
+                # discovered and validated at runtime.
                 physical_actions = None
                 if self.execution_mode == "rtc":
                     rtc_options = None
@@ -513,8 +519,10 @@ class DoubleBufferedPolicyRunner:
                             "rtc": {
                                 "prefix_actions": rtc_prefix,
                                 "prefix_length": prefix_length,  # L, Remaining prefix length of old action
-                                "estimated_delay_steps": estimated_delay_steps, # D_est
-                                "guidance_horizon": min(self.execution_horizon, prefix_length),  # H, execution_horizon is the max guidance horizon for RTC
+                                "estimated_delay_steps": estimated_delay_steps,  # D_est
+                                "guidance_horizon": min(
+                                    self.execution_horizon, prefix_length
+                                ),  # H, execution_horizon is the max guidance horizon for RTC
                                 "prefix_schedule": self.rtc_prefix_schedule,
                                 "max_guidance_weight": self.rtc_max_guidance_weight,
                             }
@@ -529,11 +537,30 @@ class DoubleBufferedPolicyRunner:
                     commands = policy_chunk.commands
                     physical_actions = policy_chunk.actions
                 else:
-                    commands = adapter.get_action(
+                    policy_chunk = adapter.get_action_chunk(
                         image=observation.image,
                         joint_positions=observation.joint_positions,
                         instruction=instruction,
-                        execution_horizon=self.execution_horizon,
+                        execution_horizon=None,
+                    )
+                    commands = policy_chunk.commands[: self.execution_horizon]
+                policy_action_horizon = len(policy_chunk.commands)
+                known_action_horizon = getattr(self, "_policy_action_horizon", None)
+                if known_action_horizon is None:
+                    if self.execution_horizon > policy_action_horizon:
+                        raise ValueError(
+                            f"--execution-horizon={self.execution_horizon} exceeds the policy "
+                            f"action horizon {policy_action_horizon} discovered from its first chunk"
+                        )
+                    self._policy_action_horizon = policy_action_horizon
+                    print(
+                        f"[inference] detected policy action horizon: {policy_action_horizon}",
+                        flush=True,
+                    )
+                elif policy_action_horizon != known_action_horizon:
+                    raise ValueError(
+                        "Policy action horizon changed between chunks: "
+                        f"expected {known_action_horizon}, got {policy_action_horizon}"
                     )
                 if not commands:
                     raise ValueError(
@@ -583,11 +610,15 @@ class DoubleBufferedPolicyRunner:
                         if self._control_tick_session == observation_session
                         else query_tick
                     )
-                    skipped_steps = max(0, ready_tick - query_tick) if rtc_prefix is not None else 0  # D_actual
+                    skipped_steps = (
+                        max(0, ready_tick - query_tick) if rtc_prefix is not None else 0
+                    )  # D_actual
                     if self.execution_mode == "temporal_ensemble":
                         self._ready_chunks.append(chunk)
                     elif self.execution_mode == "rtc":
-                        activated = self._rtc_queue.replace(chunk, skipped_steps)  # Skipped the expired steps due to the inference delay
+                        activated = self._rtc_queue.replace(
+                            chunk, skipped_steps
+                        )  # Skipped the expired steps due to the inference delay
                         if not activated:
                             print(
                                 f"[inference] RTC chunk expired before activation: "
@@ -962,7 +993,15 @@ def parse_args():
         default="double_buffer",
         help="Action execution strategy; RTC continuously replaces a guided action queue",
     )
-    parser.add_argument("--execution-horizon", type=int, default=8)
+    parser.add_argument(
+        "--execution-horizon",
+        type=int,
+        default=8,
+        help=(
+            "Execution/guidance horizon; its upper bound is discovered from the first "
+            "action chunk returned by the policy"
+        ),
+    )
     parser.add_argument(
         "--temporal-ensemble-coeff",
         type=float,
@@ -992,8 +1031,8 @@ def parse_args():
     parser.add_argument("--status-interval", type=float, default=5.0)
     parser.add_argument("--task", default=None, help="Override the task sent by RoboJuDo")
     args = parser.parse_args()
-    if not 1 <= args.execution_horizon <= ROBOJUDO_ACTION_HORIZON:
-        parser.error(f"--execution-horizon must be in [1, {ROBOJUDO_ACTION_HORIZON}]")
+    if args.execution_horizon < 1:
+        parser.error("--execution-horizon must be positive")
     if args.command_fps <= 0:
         parser.error("--command-fps must be positive")
     if args.observation_timeout <= 0:

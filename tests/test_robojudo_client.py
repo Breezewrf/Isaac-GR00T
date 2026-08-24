@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 
 ROBOJUDO_EXAMPLE = Path(__file__).parents[1] / "examples" / "RoboJuDo"
@@ -87,6 +88,34 @@ def test_rtc_queue_rejects_cross_task_prefix_and_expires_old_chunk():
     assert queue.pop() is None
 
 
+def test_parse_args_accepts_horizon_above_previous_fixed_limit():
+    argv = [
+        "run_robojudo_client.py",
+        "--profile",
+        "x2",
+        "--robot-endpoint",
+        "tcp://127.0.0.1:8561",
+        "--execution-horizon",
+        "32",
+    ]
+    with patch.object(sys, "argv", argv):
+        assert client_module.parse_args().execution_horizon == 32
+
+
+def test_parse_args_rejects_non_positive_horizon():
+    argv = [
+        "run_robojudo_client.py",
+        "--profile",
+        "x2",
+        "--robot-endpoint",
+        "tcp://127.0.0.1:8561",
+        "--execution-horizon",
+        "0",
+    ]
+    with patch.object(sys, "argv", argv), pytest.raises(SystemExit):
+        client_module.parse_args()
+
+
 def test_temporal_ensemble_equal_average_uses_aligned_chunk_diagonal():
     ensembler = client_module.ACTTemporalEnsembler(("joint",), temporal_ensemble_coeff=0.0)
     ensembler.add_chunk(_chunk(start_tick=0, values=[0.0, 1.0, 2.0, 3.0]))
@@ -161,19 +190,21 @@ def test_inference_discards_disabled_session_and_uses_reenabled_session():
         def __init__(self, policy_client, profile):
             del policy_client, profile
 
-        def get_action(self, **kwargs):
+        def get_action_chunk(self, **kwargs):
             nonlocal inference_calls
             del kwargs
             inference_calls += 1
             if inference_calls == 1:
                 first_inference_started.set()
                 assert release_first_inference.wait(timeout=1)
-            return [
-                {
-                    "positions": {},
-                    "locomotion_command": np.zeros(4, dtype=np.float32),
-                }
-            ]
+            return SimpleNamespace(
+                commands=[
+                    {
+                        "positions": {},
+                        "locomotion_command": np.zeros(4, dtype=np.float32),
+                    }
+                ]
+            )
 
     runner = client_module.DoubleBufferedPolicyRunner.__new__(
         client_module.DoubleBufferedPolicyRunner
@@ -246,11 +277,11 @@ def test_temporal_ensemble_inference_does_not_wait_for_ready_queue_to_drain():
         def __init__(self, policy_client, profile):
             del policy_client, profile
 
-        def get_action(self, **kwargs):
+        def get_action_chunk(self, **kwargs):
             nonlocal inference_calls
             del kwargs
             inference_calls += 1
-            return [_command("joint", float(inference_calls))]
+            return SimpleNamespace(commands=[_command("joint", float(inference_calls))])
 
     runner = client_module.DoubleBufferedPolicyRunner.__new__(
         client_module.DoubleBufferedPolicyRunner
@@ -377,6 +408,7 @@ def test_rtc_inference_sends_leftover_prefix_and_uses_actual_delay_on_replace():
     rtc = received_options["rtc"]
     np.testing.assert_allclose(rtc["prefix_actions"]["joint"], [[[11.0], [12.0], [13.0]]])
     assert rtc["estimated_delay_steps"] == 1
+    assert runner._policy_action_horizon == 4
     assert runner._rtc_queue.qsize() == 2
     assert runner._rtc_queue.pop()["positions"]["joint"] == 102.0
     assert not inference_thread.is_alive()
