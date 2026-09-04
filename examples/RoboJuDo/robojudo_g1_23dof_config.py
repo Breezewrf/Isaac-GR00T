@@ -16,7 +16,7 @@ robojudo_g1_23dof_config = {
     "video": ModalityConfig(delta_indices=[0], modality_keys=["ego_view"]),
     "state": ModalityConfig(
         delta_indices=[0],
-        modality_keys=["left_arm", "right_arm"],
+        modality_keys=["left_arm", "right_arm", "left_hand", "right_hand"],
         sin_cos_embedding_keys=["left_arm", "right_arm"],
     ),
     "action": ModalityConfig(
@@ -24,6 +24,8 @@ robojudo_g1_23dof_config = {
         modality_keys=[
             "left_arm",
             "right_arm",
+            "left_hand",
+            "right_hand",
             "navigate_command",
             "base_height_command",
         ],
@@ -35,6 +37,18 @@ robojudo_g1_23dof_config = {
             ),
             ActionConfig(
                 rep=ActionRepresentation.RELATIVE,
+                type=ActionType.NON_EEF,
+                format=ActionFormat.DEFAULT,
+            ),
+            # Dexterous-hand actions are absolute actuator targets; unlike arm
+            # actions, they must not be offset by the measured joint feedback.
+            ActionConfig(
+                rep=ActionRepresentation.ABSOLUTE,
+                type=ActionType.NON_EEF,
+                format=ActionFormat.DEFAULT,
+            ),
+            ActionConfig(
+                rep=ActionRepresentation.ABSOLUTE,
                 type=ActionType.NON_EEF,
                 format=ActionFormat.DEFAULT,
             ),

@@ -14,6 +14,8 @@ from gr00t.data.types import (
 
 robojudo_x2_config = {
     "video": ModalityConfig(delta_indices=[0], modality_keys=["ego_view"]),
+    # left_hand/right_hand are intentionally omitted until X2 hand telemetry and
+    # commands are connected. The deployment profile reserves those group names.
     "state": ModalityConfig(
         delta_indices=[0],
         modality_keys=["left_arm", "right_arm"],

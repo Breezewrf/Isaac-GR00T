@@ -8,12 +8,13 @@ The two profiles are intentionally separate:
 
 | Profile | State | Action | Config |
 | --- | --- | --- | --- |
-| G1 23-DoF | 5 left-arm + 5 right-arm joints | 10 joint targets + `vx`, `vy`, yaw rate, height | `robojudo_g1_23dof_config.py` |
+| G1 23-DoF | 5 left-arm + 5 right-arm + 10 left-hand + 10 right-hand joints | 30 joint targets + `vx`, `vy`, yaw rate, height | `robojudo_g1_23dof_config.py` |
 | X2 | 7 left-arm + 7 right-arm joints | 14 joint targets + `vx`, `vy`, yaw rate, height | `robojudo_x2_config.py` |
 
-Arm targets are trained as actions relative to the measured joint state. Navigation and height
-commands remain absolute. Both profiles use a 16-frame action horizon and the episode task text
-as language input.
+Arm targets are trained as actions relative to the measured joint state. G1 dexterous-hand,
+navigation, and height targets remain absolute. X2 hand groups are reserved in the deployment
+profile but are omitted from its policy modalities until hand telemetry and commands are connected.
+Both profiles use a 16-frame action horizon and the episode task text as language input.
 
 ## Prepare G1 23-DoF data
 
@@ -84,15 +85,19 @@ observation = {
     "state": {
         "left_arm": left_joint_positions,
         "right_arm": right_joint_positions,
+        # Present for G1; currently omitted for X2.
+        "left_hand": left_hand_joint_positions,
+        "right_hand": right_hand_joint_positions,
     },
     "language": {"task": [[instruction]]},
 }
 ```
 
-They return four action groups: `left_arm`, `right_arm`, `navigate_command`, and
-`base_height_command`. `navigate_command` is ordered as `[vx, vy, yaw_rate]`. The decoded arm
-outputs are absolute joint targets because the policy converts the learned relative actions back
-using the current state.
+The G1 policy returns six action groups: `left_arm`, `right_arm`, `left_hand`, `right_hand`,
+`navigate_command`, and `base_height_command`. X2 continues to return the original four groups
+without hands. `navigate_command` is ordered as `[vx, vy, yaw_rate]`. The decoded arm outputs are
+absolute joint targets because the policy converts the learned relative actions back using the
+current state.
 
 X2 and G1 have different state/action dimensions. Do not mix them in one `NEW_EMBODIMENT`
 training run or use one robot's checkpoint for the other.

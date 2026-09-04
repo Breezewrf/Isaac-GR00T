@@ -13,6 +13,7 @@ import pytest
 ROBOJUDO_EXAMPLE = Path(__file__).parents[1] / "examples" / "RoboJuDo"
 sys.path.insert(0, str(ROBOJUDO_EXAMPLE))
 
+import deploy_adapter as adapter_module  # noqa: E402
 import run_robojudo_client as client_module  # noqa: E402
 
 
@@ -60,6 +61,58 @@ def _rtc_chunk(*, values: list[float], task: str = "test task"):
         physical_actions={"joint": actions},
         task=task,
     )
+
+
+def test_g1_adapter_splits_and_decodes_dexterous_hand_joints():
+    profile = adapter_module.PROFILES["g1_23dof"]
+    adapter = adapter_module.RoboJuDoPolicyAdapter(object(), "g1_23dof")
+    positions = np.arange(30, dtype=np.float32)
+
+    observation = adapter.build_observation(
+        np.zeros((4, 5, 3), dtype=np.uint8),
+        positions,
+        "pick up the bag",
+    )
+
+    assert tuple(observation["state"]) == (
+        "left_arm",
+        "right_arm",
+        "left_hand",
+        "right_hand",
+    )
+    np.testing.assert_array_equal(observation["state"]["left_arm"], positions[0:5][None, None])
+    np.testing.assert_array_equal(observation["state"]["right_arm"], positions[5:10][None, None])
+    np.testing.assert_array_equal(observation["state"]["left_hand"], positions[10:20][None, None])
+    np.testing.assert_array_equal(observation["state"]["right_hand"], positions[20:30][None, None])
+
+    action_chunk = {
+        "left_arm": positions[0:5][None, None],
+        "right_arm": positions[5:10][None, None],
+        "left_hand": positions[10:20][None, None],
+        "right_hand": positions[20:30][None, None],
+        "navigate_command": np.asarray([[[0.1, 0.2, 0.3]]], dtype=np.float32),
+        "base_height_command": np.asarray([[[0.75]]], dtype=np.float32),
+    }
+    command = adapter.decode_action_chunk(action_chunk, execution_horizon=1)[0]
+
+    assert tuple(command["positions"]) == profile.joint_names
+    np.testing.assert_array_equal(list(command["positions"].values()), positions)
+    np.testing.assert_allclose(command["locomotion_command"], [0.1, 0.2, 0.3, 0.75])
+
+
+def test_x2_adapter_reserves_hands_without_requiring_them():
+    profile = adapter_module.PROFILES["x2"]
+    assert profile.left_hand_joint_names == ()
+    assert profile.right_hand_joint_names == ()
+    assert tuple(key for key, _ in profile.joint_groups) == ("left_arm", "right_arm")
+
+    adapter = adapter_module.RoboJuDoPolicyAdapter(object(), "x2")
+    observation = adapter.build_observation(
+        np.zeros((4, 5, 3), dtype=np.uint8),
+        np.arange(14, dtype=np.float32),
+        "test x2",
+    )
+    assert tuple(observation["state"]) == ("left_arm", "right_arm")
 
 
 def test_rtc_queue_replaces_using_actual_delay_and_keeps_prefix_in_lockstep():

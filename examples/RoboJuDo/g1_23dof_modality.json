@@ -7,6 +7,14 @@
         "right_arm": {
             "start": 5,
             "end": 10
+        },
+        "left_hand": {
+            "start": 10,
+            "end": 20
+        },
+        "right_hand": {
+            "start": 20,
+            "end": 30
         }
     },
     "action": {
@@ -18,13 +26,21 @@
             "start": 5,
             "end": 10
         },
-        "navigate_command": {
+        "left_hand": {
             "start": 10,
-            "end": 13
+            "end": 20
+        },
+        "right_hand": {
+            "start": 20,
+            "end": 30
+        },
+        "navigate_command": {
+            "start": 30,
+            "end": 33
         },
         "base_height_command": {
-            "start": 13,
-            "end": 14
+            "start": 33,
+            "end": 34
         }
     },
     "video": {
