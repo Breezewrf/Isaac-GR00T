@@ -4,16 +4,46 @@ This example adapts datasets produced by `robojudo_recorder` for GR00T N1.7. The
 writes LeRobot v3.0; GR00T currently trains from its LeRobot v2.1 layout plus
 `meta/modality.json`.
 
+## ZMQ ports at a glance
+
+The robot pipeline and the deployment client use two separate ZMQ data channels:
+
+| Port | Direction | ZMQ role | Payload | Socket ownership |
+| --- | --- | --- | --- | --- |
+| `8561` | robot → deploy client | observation PUB/SUB | One or more JPEG images, measured joints, task, session metadata | RoboJuDo pipeline binds; client connects with `--robot-endpoint` |
+| `8559` | deploy client → robot | command PUB/SUB | Joint targets plus `[vx, vy, yaw_rate, height]` | deploy client binds with `--command-endpoint`; robot pipeline connects via `--gr00t-command-endpoint` |
+
+```text
+┌─────────────────────────┐   observation: PUB :8561   ┌────────────────────────────┐
+│ RoboJuDo robot pipeline │ ─────────────────────────▶ │ Deployment client           │
+│ scripts/run_pipeline.py │                            │ run_robojudo_client.py     │
+│ connects SUB :8559      │ ◀───────────────────────── │ binds PUB :8559             │
+└─────────────────────────┘      command: :8559        └──────────────┬─────────────┘
+                                                                      │ policy RPC :5555
+                                                                      ▼
+                                                        ┌────────────────────────────┐
+                                                        │ GR00T policy server         │
+                                                        │ run_gr00t_server.py         │
+                                                        └────────────────────────────┘
+```
+
+These are independent of the GR00T policy-server port (`5555`). In a same-host setup, use
+`tcp://127.0.0.1:8561` for the client observation endpoint and `tcp://127.0.0.1:8559` for the
+pipeline command endpoint. Do not reverse the two ports: `8561` carries observations and `8559`
+carries commands. For a multi-host setup, replace `127.0.0.1` with the host running the relevant
+publisher; keep the deployment client's `--command-endpoint tcp://*:8559` bind address unchanged.
+
 The two profiles are intentionally separate:
 
 | Profile | State | Action | Config |
 | --- | --- | --- | --- |
-| G1 23-DoF | 5 left-arm + 5 right-arm joints | 10 joint targets + `vx`, `vy`, yaw rate, height | `robojudo_g1_23dof_config.py` |
+| G1 23-DoF | 5 left-arm + 5 right-arm + 10 left-hand + 10 right-hand joints | 30 joint targets + `vx`, `vy`, yaw rate, height | `robojudo_g1_23dof_config.py` |
 | X2 | 7 left-arm + 7 right-arm joints | 14 joint targets + `vx`, `vy`, yaw rate, height | `robojudo_x2_config.py` |
 
-Arm targets are trained as actions relative to the measured joint state. Navigation and height
-commands remain absolute. Both profiles use a 16-frame action horizon and the episode task text
-as language input.
+Arm targets are trained as actions relative to the measured joint state. G1 dexterous-hand,
+navigation, and height targets remain absolute. X2 hand groups are reserved in the deployment
+profile but are omitted from its policy modalities until hand telemetry and commands are connected.
+Both profiles use a 16-frame action horizon and the episode task text as language input.
 
 ## Prepare G1 23-DoF data
 
@@ -80,19 +110,28 @@ The trained policies expect observations grouped as follows:
 
 ```python
 observation = {
-    "video": {"ego_view": images},
+    "video": {
+        "ego_view": head_images,
+        # Present for a G1 checkpoint trained with the mulcam config.
+        "left_wrist_view": left_wrist_images,
+        "right_wrist_view": right_wrist_images,
+    },
     "state": {
         "left_arm": left_joint_positions,
         "right_arm": right_joint_positions,
+        # Present for G1; currently omitted for X2.
+        "left_hand": left_hand_joint_positions,
+        "right_hand": right_hand_joint_positions,
     },
     "language": {"task": [[instruction]]},
 }
 ```
 
-They return four action groups: `left_arm`, `right_arm`, `navigate_command`, and
-`base_height_command`. `navigate_command` is ordered as `[vx, vy, yaw_rate]`. The decoded arm
-outputs are absolute joint targets because the policy converts the learned relative actions back
-using the current state.
+The G1 policy returns six action groups: `left_arm`, `right_arm`, `left_hand`, `right_hand`,
+`navigate_command`, and `base_height_command`. X2 continues to return the original four groups
+without hands. `navigate_command` is ordered as `[vx, vy, yaw_rate]`. The decoded arm outputs are
+absolute joint targets because the policy converts the learned relative actions back using the
+current state.
 
 X2 and G1 have different state/action dimensions. Do not mix them in one `NEW_EMBODIMENT`
 training run or use one robot's checkpoint for the other.
@@ -125,6 +164,38 @@ G1 uses a RealSense camera by default. X2 uses the configured ROS2 compressed im
 both cases, `Gr00tZmqCtrl` publishes a msgpack/JPEG multipart observation stream on port 8561;
 the deploy client does not open the robot camera itself.
 
+Single-camera observations use protocol v1 with two multipart frames:
+
+```text
+[msgpack header, ego_view JPEG]
+```
+
+The G1 multi-camera deployment uses protocol v2. The publisher must send the header and all three
+JPEGs atomically in the declared order:
+
+```text
+[msgpack header, ego_view JPEG, left_wrist_view JPEG, right_wrist_view JPEG]
+```
+
+The v2 header adds the following fields while retaining all v1 session, task, joint-name, and
+joint-position fields:
+
+```python
+{
+    "protocol_version": 2,
+    "image_keys": ["ego_view", "left_wrist_view", "right_wrist_view"],
+    "image_shapes": {
+        "ego_view": [480, 640, 3],
+        "left_wrist_view": [480, 640, 3],
+        "right_wrist_view": [480, 640, 3],
+    },
+}
+```
+
+Do not publish each camera as a separate ZMQ message: a policy observation must contain a coherent
+set of views. The robot publisher should skip an observation when a required camera has no usable
+frame, and should enforce an application-appropriate maximum timestamp skew between the views.
+
 On the deploy machine, run the subscriber/client after starting the policy server:
 
 ```bash
@@ -139,6 +210,24 @@ uv run python examples/RoboJuDo/run_robojudo_client.py \
 Use `--profile x2` for X2. The client validates the profile and exact joint order before inference.
 One thread receives the latest RoboJuDo observation, one performs policy inference, and the command
 loop keeps publishing at 30 Hz. Select the action scheduler with `--execution-mode`.
+
+For a G1 checkpoint trained with `robojudo_g1_23dof_mulcam_config.py`, select the v2 three-camera
+layout explicitly:
+
+```bash
+uv run python examples/RoboJuDo/run_robojudo_client.py \
+  --profile g1_23dof \
+  --camera-layout mulcam \
+  --robot-endpoint tcp://<robot-ip>:8561 \
+  --policy-host <policy-server-ip> \
+  --policy-port 5555 \
+  --command-endpoint tcp://*:8559 \
+  --execution-mode rtc \
+  --execution-horizon 8
+```
+
+The default `--camera-layout single` remains compatible with protocol v1 and single-camera
+checkpoints. A layout mismatch fails before policy inference instead of silently omitting a view.
 
 ### Execution modes
 
@@ -367,8 +456,10 @@ waiting.
 If the active horizon finishes before another chunk is ready, the client keeps publishing the last
 command. This includes its locomotion values, so a non-zero velocity command is held until a new
 chunk arrives, the observation stream times out, or the robot-side watchdog stops it. If the
-observation age exceeds `--observation-timeout`, the client clears both active and pending actions
-and stops publishing until observations become fresh again.
+observation age exceeds `--observation-timeout`, the client clears both active and pending actions,
+but keeps publishing a safe hold command at `--command-fps`: upper-body joint positions and base
+height remain at their last commanded values, while `vx`, `vy`, and `yaw_rate` are set to zero. If
+no command has been published yet, there is no previous pose to hold and publishing remains idle.
 
 In `temporal_ensemble` mode, an uncovered tick instead holds the last arm positions and base height
 while forcing `vx`, `vy`, and `yaw_rate` to zero. Takeover disable, session changes, stream changes,
@@ -425,6 +516,6 @@ JPEG decoding cannot keep up.
 `subscriber_connected=True` is a ZeroMQ transport connection signal, not an application-level
 acknowledgement that RoboJuDo applied a command. Command application and watchdog state remain
 visible in the RoboJuDo process logs. If observations stop, the client reports their age, clears
-pending actions, and stops publishing commands after `--observation-timeout`. If inference is late,
-the client reports that the action horizon is exhausted and holds the last command until a fresh
-chunk arrives.
+pending actions, and after `--observation-timeout` continuously publishes the last upper-body and
+base-height targets with `vx`, `vy`, and `yaw_rate` set to zero. If inference is late, the client
+reports that the action horizon is exhausted and holds the last command until a fresh chunk arrives.

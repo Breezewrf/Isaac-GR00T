@@ -13,7 +13,14 @@ from gr00t.data.types import (
 
 
 robojudo_g1_23dof_config = {
-    "video": ModalityConfig(delta_indices=[0], modality_keys=["ego_view"]),
+    "video": ModalityConfig(
+        delta_indices=[0],
+        modality_keys=[
+            "ego_view",
+            "left_wrist_view",
+            "right_wrist_view",
+        ],
+    ),
     "state": ModalityConfig(
         delta_indices=[0],
         modality_keys=["left_arm", "right_arm", "left_hand", "right_hand"],

@@ -14,37 +14,80 @@ import numpy as np
 
 @dataclass(frozen=True)
 class RobotProfile:
-    joint_names: tuple[str, ...]
-    arm_width: int
+    left_arm_joint_names: tuple[str, ...]
+    right_arm_joint_names: tuple[str, ...]
+    # Reserved as empty tuples for robots whose dexterous hands are not wired yet.
+    left_hand_joint_names: tuple[str, ...] = ()
+    right_hand_joint_names: tuple[str, ...] = ()
+
+    @property
+    def joint_groups(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Policy joint modalities that are active for this deployment profile."""
+        groups = (
+            ("left_arm", self.left_arm_joint_names),
+            ("right_arm", self.right_arm_joint_names),
+            ("left_hand", self.left_hand_joint_names),
+            ("right_hand", self.right_hand_joint_names),
+        )
+        return tuple((key, names) for key, names in groups if names)
+
+    @property
+    def joint_names(self) -> tuple[str, ...]:
+        return tuple(name for _, names in self.joint_groups for name in names)
 
 
 @dataclass(frozen=True)
 class PolicyActionChunk:
     """Physical policy actions together with their RoboJuDo command encoding."""
 
-    actions: dict[str, np.ndarray] # For RTC prefix guidance
-    commands: list[dict[str, Any]] # For loop execution
+    actions: dict[str, np.ndarray]  # For RTC prefix guidance
+    commands: list[dict[str, Any]]  # For loop execution
     info: dict[str, Any]
 
 
 PROFILES = {
     "g1_23dof": RobotProfile(
-        joint_names=(
+        left_arm_joint_names=(
             "left_shoulder_pitch_joint",
             "left_shoulder_roll_joint",
             "left_shoulder_yaw_joint",
             "left_elbow_joint",
             "left_wrist_roll_joint",
+        ),
+        right_arm_joint_names=(
             "right_shoulder_pitch_joint",
             "right_shoulder_roll_joint",
             "right_shoulder_yaw_joint",
             "right_elbow_joint",
             "right_wrist_roll_joint",
         ),
-        arm_width=5,
+        left_hand_joint_names=(
+            "left_thumb_proximal",
+            "left_thumb_intermediate",
+            "left_index_proximal",
+            "left_middle_proximal",
+            "left_ring_proximal",
+            "left_pinky_proximal",
+            "left_index_intermediate",
+            "left_middle_intermediate",
+            "left_ring_intermediate",
+            "left_pinky_intermediate",
+        ),
+        right_hand_joint_names=(
+            "right_thumb_proximal",
+            "right_thumb_intermediate",
+            "right_index_proximal",
+            "right_middle_proximal",
+            "right_ring_proximal",
+            "right_pinky_proximal",
+            "right_index_intermediate",
+            "right_middle_intermediate",
+            "right_ring_intermediate",
+            "right_pinky_intermediate",
+        ),
     ),
     "x2": RobotProfile(
-        joint_names=(
+        left_arm_joint_names=(
             "left_shoulder_pitch_joint",
             "left_shoulder_roll_joint",
             "left_shoulder_yaw_joint",
@@ -52,6 +95,8 @@ PROFILES = {
             "left_wrist_yaw_joint",
             "left_wrist_pitch_joint",
             "left_wrist_roll_joint",
+        ),
+        right_arm_joint_names=(
             "right_shoulder_pitch_joint",
             "right_shoulder_roll_joint",
             "right_shoulder_yaw_joint",
@@ -60,17 +105,29 @@ PROFILES = {
             "right_wrist_pitch_joint",
             "right_wrist_roll_joint",
         ),
-        arm_width=7,
+        # X2 hand names stay empty until its observation/command transport is connected.
+        left_hand_joint_names=(),
+        right_hand_joint_names=(),
     ),
+}
+
+CAMERA_LAYOUTS = {
+    "single": ("ego_view",),
+    "mulcam": ("ego_view", "left_wrist_view", "right_wrist_view"),
 }
 
 
 class RoboJuDoPolicyAdapter:
     """Translate RoboJuDo observations and GR00T action chunks without changing units."""
 
-    def __init__(self, policy_client: PolicyClient, profile: str):
+    def __init__(self, policy_client: PolicyClient, profile: str,
+        video_keys: Sequence[str] = CAMERA_LAYOUTS["single"],
+    ):
         self.policy_client = policy_client
         self.profile = PROFILES[profile]
+        self.video_keys = tuple(video_keys)
+        if not self.video_keys or len(set(self.video_keys)) != len(self.video_keys):
+            raise ValueError("video_keys must be a non-empty sequence of unique names")
 
     def _ordered_joint_positions(
         self, joint_positions: Mapping[str, float] | Sequence[float] | np.ndarray
@@ -94,32 +151,49 @@ class RoboJuDoPolicyAdapter:
 
     def build_observation(
         self,
-        image: np.ndarray,
+        images: Mapping[str, np.ndarray] | np.ndarray,
         joint_positions: Mapping[str, float] | Sequence[float] | np.ndarray,
         instruction: str,
     ) -> dict[str, Any]:
-        image = np.asarray(image)
-        if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != np.uint8:
-            raise ValueError("image must be an HWC uint8 RGB array")
+        if isinstance(images, np.ndarray):
+            images = {"ego_view": images}
+        missing = [key for key in self.video_keys if key not in images]
+        unexpected = [key for key in images if key not in self.video_keys]
+        if missing or unexpected:
+            raise ValueError(
+                f"Video keys do not match deployment layout: missing={missing}, "
+                f"unexpected={unexpected}"
+            )
+        video = {}
+        for key in self.video_keys:
+            image = np.asarray(images[key])
+            if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != np.uint8:
+                raise ValueError(f"Video {key!r} must be an HWC uint8 RGB array")
+            video[key] = image[None, None]
         if not instruction:
             raise ValueError("instruction must not be empty")
         positions = self._ordered_joint_positions(joint_positions)
-        split = self.profile.arm_width
         return {
-            "video": {"ego_view": image[None, None]},
-            "state": {
-                "left_arm": positions[:split][None, None],
-                "right_arm": positions[split:][None, None],
-            },
+            "video": video,
+            "state": self._split_joint_groups(positions),
             "language": {"task": [[instruction]]},
         }
+
+    def _split_joint_groups(self, positions: np.ndarray) -> dict[str, np.ndarray]:
+        groups = {}
+        start = 0
+        for key, names in self.profile.joint_groups:
+            end = start + len(names)
+            groups[key] = positions[start:end][None, None]
+            start = end
+        assert start == len(positions)
+        return groups
 
     def _validate_action_chunk(
         self, action_chunk: Mapping[str, np.ndarray]
     ) -> tuple[dict[str, np.ndarray], int]:
         required = {
-            "left_arm": self.profile.arm_width,
-            "right_arm": self.profile.arm_width,
+            **{key: len(names) for key, names in self.profile.joint_groups},
             "navigate_command": 3,
             "base_height_command": 1,
         }
@@ -150,8 +224,8 @@ class RoboJuDoPolicyAdapter:
 
         commands = []
         for step in range(execution_horizon):
-            arm_positions = np.concatenate(
-                (arrays["left_arm"][0, step], arrays["right_arm"][0, step])
+            joint_positions = np.concatenate(
+                [arrays[key][0, step] for key, _ in self.profile.joint_groups]
             )
             locomotion_command = np.concatenate(
                 (
@@ -162,7 +236,7 @@ class RoboJuDoPolicyAdapter:
             commands.append(
                 {
                     "positions": dict(
-                        zip(self.profile.joint_names, arm_positions.tolist(), strict=True)
+                        zip(self.profile.joint_names, joint_positions.tolist(), strict=True)
                     ),
                     "locomotion_command": locomotion_command,
                 }
@@ -171,7 +245,7 @@ class RoboJuDoPolicyAdapter:
 
     def get_action_chunk(
         self,
-        image: np.ndarray,
+        images: Mapping[str, np.ndarray] | np.ndarray,
         joint_positions: Mapping[str, float] | Sequence[float] | np.ndarray,
         instruction: str,
         *,
@@ -179,7 +253,7 @@ class RoboJuDoPolicyAdapter:
         options: dict[str, Any] | None = None,
     ) -> PolicyActionChunk:
         """Return the physical chunk and commands; RTC uses all available steps."""
-        observation = self.build_observation(image, joint_positions, instruction)
+        observation = self.build_observation(images, joint_positions, instruction)
 
         # Inference, pass the options to the Policy client
         action_chunk, info = self.policy_client.get_action(observation, options=options)
@@ -196,14 +270,14 @@ class RoboJuDoPolicyAdapter:
 
     def get_action(
         self,
-        image: np.ndarray,
+        images: Mapping[str, np.ndarray] | np.ndarray,
         joint_positions: Mapping[str, float] | Sequence[float] | np.ndarray,
         instruction: str,
         *,
         execution_horizon: int = 8,
     ) -> list[dict[str, Any]]:
         return self.get_action_chunk(  # Only need the commands except for RTC, which uses get_action_chunk() to get the actions for prefix guidance
-            image,
+            images,
             joint_positions,
             instruction,
             execution_horizon=execution_horizon,

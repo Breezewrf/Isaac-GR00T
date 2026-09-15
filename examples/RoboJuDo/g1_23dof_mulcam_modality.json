@@ -46,6 +46,12 @@
     "video": {
         "ego_view": {
             "original_key": "observation.images.head_rgb"
+        },
+        "left_wrist_view": {
+            "original_key": "observation.images.left_wrist_rgb"
+        },
+        "right_wrist_view": {
+            "original_key": "observation.images.right_wrist_rgb"
         }
     }
 }
