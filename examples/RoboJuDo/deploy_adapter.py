@@ -111,13 +111,23 @@ PROFILES = {
     ),
 }
 
+CAMERA_LAYOUTS = {
+    "single": ("ego_view",),
+    "mulcam": ("ego_view", "left_wrist_view", "right_wrist_view"),
+}
+
 
 class RoboJuDoPolicyAdapter:
     """Translate RoboJuDo observations and GR00T action chunks without changing units."""
 
-    def __init__(self, policy_client: PolicyClient, profile: str):
+    def __init__(self, policy_client: PolicyClient, profile: str,
+        video_keys: Sequence[str] = CAMERA_LAYOUTS["single"],
+    ):
         self.policy_client = policy_client
         self.profile = PROFILES[profile]
+        self.video_keys = tuple(video_keys)
+        if not self.video_keys or len(set(self.video_keys)) != len(self.video_keys):
+            raise ValueError("video_keys must be a non-empty sequence of unique names")
 
     def _ordered_joint_positions(
         self, joint_positions: Mapping[str, float] | Sequence[float] | np.ndarray
@@ -141,18 +151,30 @@ class RoboJuDoPolicyAdapter:
 
     def build_observation(
         self,
-        image: np.ndarray,
+        images: Mapping[str, np.ndarray] | np.ndarray,
         joint_positions: Mapping[str, float] | Sequence[float] | np.ndarray,
         instruction: str,
     ) -> dict[str, Any]:
-        image = np.asarray(image)
-        if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != np.uint8:
-            raise ValueError("image must be an HWC uint8 RGB array")
+        if isinstance(images, np.ndarray):
+            images = {"ego_view": images}
+        missing = [key for key in self.video_keys if key not in images]
+        unexpected = [key for key in images if key not in self.video_keys]
+        if missing or unexpected:
+            raise ValueError(
+                f"Video keys do not match deployment layout: missing={missing}, "
+                f"unexpected={unexpected}"
+            )
+        video = {}
+        for key in self.video_keys:
+            image = np.asarray(images[key])
+            if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != np.uint8:
+                raise ValueError(f"Video {key!r} must be an HWC uint8 RGB array")
+            video[key] = image[None, None]
         if not instruction:
             raise ValueError("instruction must not be empty")
         positions = self._ordered_joint_positions(joint_positions)
         return {
-            "video": {"ego_view": image[None, None]},
+            "video": video,
             "state": self._split_joint_groups(positions),
             "language": {"task": [[instruction]]},
         }
@@ -223,7 +245,7 @@ class RoboJuDoPolicyAdapter:
 
     def get_action_chunk(
         self,
-        image: np.ndarray,
+        images: Mapping[str, np.ndarray] | np.ndarray,
         joint_positions: Mapping[str, float] | Sequence[float] | np.ndarray,
         instruction: str,
         *,
@@ -231,7 +253,7 @@ class RoboJuDoPolicyAdapter:
         options: dict[str, Any] | None = None,
     ) -> PolicyActionChunk:
         """Return the physical chunk and commands; RTC uses all available steps."""
-        observation = self.build_observation(image, joint_positions, instruction)
+        observation = self.build_observation(images, joint_positions, instruction)
 
         # Inference, pass the options to the Policy client
         action_chunk, info = self.policy_client.get_action(observation, options=options)
@@ -248,14 +270,14 @@ class RoboJuDoPolicyAdapter:
 
     def get_action(
         self,
-        image: np.ndarray,
+        images: Mapping[str, np.ndarray] | np.ndarray,
         joint_positions: Mapping[str, float] | Sequence[float] | np.ndarray,
         instruction: str,
         *,
         execution_horizon: int = 8,
     ) -> list[dict[str, Any]]:
         return self.get_action_chunk(  # Only need the commands except for RTC, which uses get_action_chunk() to get the actions for prefix guidance
-            image,
+            images,
             joint_positions,
             instruction,
             execution_horizon=execution_horizon,

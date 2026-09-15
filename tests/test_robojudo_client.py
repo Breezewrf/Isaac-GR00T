@@ -23,7 +23,7 @@ def _observation(*, session: int, enabled: bool, sequence: int):
         control_session=session,
         takeover_enabled=enabled,
         sequence=sequence,
-        image=np.zeros((2, 2, 3), dtype=np.uint8),
+        images={"ego_view": np.zeros((2, 2, 3), dtype=np.uint8)},
         joint_positions={},
         task="test task",
     )
@@ -100,6 +100,94 @@ def test_g1_adapter_splits_and_decodes_dexterous_hand_joints():
     np.testing.assert_allclose(command["locomotion_command"], [0.1, 0.2, 0.3, 0.75])
 
 
+def test_g1_mulcam_adapter_builds_all_video_modalities():
+    video_keys = adapter_module.CAMERA_LAYOUTS["mulcam"]
+    adapter = adapter_module.RoboJuDoPolicyAdapter(object(), "g1_23dof", video_keys)
+    images = {
+        key: np.full((4, 5, 3), index, dtype=np.uint8) for index, key in enumerate(video_keys)
+    }
+
+    observation = adapter.build_observation(
+        images,
+        np.arange(30, dtype=np.float32),
+        "pick up the bag",
+    )
+
+    assert tuple(observation["video"]) == video_keys
+    for key in video_keys:
+        assert observation["video"][key].shape == (1, 1, 4, 5, 3)
+        np.testing.assert_array_equal(observation["video"][key][0, 0], images[key])
+
+
+def _encoded_observation_parts(protocol_version: int, image_keys: tuple[str, ...]):
+    profile = "x2"
+    joint_names = adapter_module.PROFILES[profile].joint_names
+    images = {
+        key: np.full((6, 8, 3), index * 20, dtype=np.uint8) for index, key in enumerate(image_keys)
+    }
+    header = {
+        "protocol_version": protocol_version,
+        "profile": profile,
+        "joint_names": list(joint_names),
+        "joint_positions": [0.0] * len(joint_names),
+        "task": "test task",
+        "stream_id": "test-stream",
+        "control_session": 1,
+        "takeover_enabled": True,
+        "sequence": 7,
+    }
+    if protocol_version == 1:
+        header["shape"] = list(images["ego_view"].shape)
+    else:
+        header["image_keys"] = list(image_keys)
+        header["image_shapes"] = {key: list(image.shape) for key, image in images.items()}
+    parts = [client_module.msgpack.packb(header, use_bin_type=True)]
+    for key in image_keys:
+        ok, jpeg = client_module.cv2.imencode(".jpg", images[key])
+        assert ok
+        parts.append(jpeg.tobytes())
+    return profile, parts
+
+
+def test_observation_subscriber_decodes_protocol_v1_single_camera():
+    profile, parts = _encoded_observation_parts(1, ("ego_view",))
+    subscriber = client_module.ObservationSubscriber.__new__(client_module.ObservationSubscriber)
+    subscriber.profile = profile
+    subscriber.expected_joint_names = adapter_module.PROFILES[profile].joint_names
+    subscriber.expected_image_keys = adapter_module.CAMERA_LAYOUTS["single"]
+
+    observation = subscriber._decode_observation(parts)
+
+    assert tuple(observation.images) == ("ego_view",)
+    assert observation.images["ego_view"].shape == (6, 8, 3)
+
+
+def test_observation_subscriber_decodes_protocol_v2_mulcam():
+    image_keys = adapter_module.CAMERA_LAYOUTS["mulcam"]
+    profile, parts = _encoded_observation_parts(2, image_keys)
+    subscriber = client_module.ObservationSubscriber.__new__(client_module.ObservationSubscriber)
+    subscriber.profile = profile
+    subscriber.expected_joint_names = adapter_module.PROFILES[profile].joint_names
+    subscriber.expected_image_keys = image_keys
+
+    observation = subscriber._decode_observation(parts)
+
+    assert tuple(observation.images) == image_keys
+    assert all(image.shape == (6, 8, 3) for image in observation.images.values())
+
+
+def test_observation_subscriber_rejects_missing_mulcam_part():
+    image_keys = adapter_module.CAMERA_LAYOUTS["mulcam"]
+    profile, parts = _encoded_observation_parts(2, image_keys)
+    subscriber = client_module.ObservationSubscriber.__new__(client_module.ObservationSubscriber)
+    subscriber.profile = profile
+    subscriber.expected_joint_names = adapter_module.PROFILES[profile].joint_names
+    subscriber.expected_image_keys = image_keys
+
+    with pytest.raises(ValueError, match="has 3 parts, expected 4"):
+        subscriber._decode_observation(parts[:-1])
+
+
 def test_x2_adapter_reserves_hands_without_requiring_them():
     profile = adapter_module.PROFILES["x2"]
     assert profile.left_hand_joint_names == ()
@@ -167,6 +255,20 @@ def test_parse_args_rejects_non_positive_horizon():
     ]
     with patch.object(sys, "argv", argv), pytest.raises(SystemExit):
         client_module.parse_args()
+
+
+def test_parse_args_accepts_g1_mulcam_layout():
+    argv = [
+        "run_robojudo_client.py",
+        "--profile",
+        "g1_23dof",
+        "--camera-layout",
+        "mulcam",
+        "--robot-endpoint",
+        "tcp://127.0.0.1:8561",
+    ]
+    with patch.object(sys, "argv", argv):
+        assert client_module.parse_args().camera_layout == "mulcam"
 
 
 def test_temporal_ensemble_equal_average_uses_aligned_chunk_diagonal():
@@ -240,8 +342,8 @@ def test_inference_discards_disabled_session_and_uses_reenabled_session():
             return None
 
     class FakeAdapter:
-        def __init__(self, policy_client, profile):
-            del policy_client, profile
+        def __init__(self, policy_client, profile, video_keys):
+            del policy_client, profile, video_keys
 
         def get_action_chunk(self, **kwargs):
             nonlocal inference_calls
@@ -268,6 +370,7 @@ def test_inference_discards_disabled_session_and_uses_reenabled_session():
     runner.task_override = None
     runner.execution_horizon = 1
     runner.execution_mode = "double_buffer"
+    runner.video_keys = adapter_module.CAMERA_LAYOUTS["single"]
     runner._condition = threading.Condition()
     runner._stopping = False
     runner._error = None
@@ -327,8 +430,8 @@ def test_temporal_ensemble_inference_does_not_wait_for_ready_queue_to_drain():
             return None
 
     class FakeAdapter:
-        def __init__(self, policy_client, profile):
-            del policy_client, profile
+        def __init__(self, policy_client, profile, video_keys):
+            del policy_client, profile, video_keys
 
         def get_action_chunk(self, **kwargs):
             nonlocal inference_calls
@@ -345,6 +448,7 @@ def test_temporal_ensemble_inference_does_not_wait_for_ready_queue_to_drain():
     runner.task_override = None
     runner.execution_horizon = 1
     runner.execution_mode = "temporal_ensemble"
+    runner.video_keys = adapter_module.CAMERA_LAYOUTS["single"]
     runner._condition = threading.Condition()
     runner._stopping = False
     runner._error = None
@@ -393,8 +497,8 @@ def test_rtc_inference_sends_leftover_prefix_and_uses_actual_delay_on_replace():
             return None
 
     class FakeAdapter:
-        def __init__(self, policy_client, profile):
-            del policy_client, profile
+        def __init__(self, policy_client, profile, video_keys):
+            del policy_client, profile, video_keys
 
         def get_action_chunk(self, **kwargs):
             nonlocal received_options
@@ -416,6 +520,7 @@ def test_rtc_inference_sends_leftover_prefix_and_uses_actual_delay_on_replace():
     runner.task_override = None
     runner.execution_horizon = 3
     runner.execution_mode = "rtc"
+    runner.video_keys = adapter_module.CAMERA_LAYOUTS["single"]
     runner.rtc_prefix_schedule = "exp"
     runner.rtc_max_guidance_weight = 10.0
     runner.command_period = 0.1

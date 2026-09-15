@@ -13,7 +13,7 @@ import threading
 import time
 
 import cv2
-from deploy_adapter import PROFILES, RoboJuDoPolicyAdapter
+from deploy_adapter import CAMERA_LAYOUTS, PROFILES, RoboJuDoPolicyAdapter
 from gr00t.policy.server_client import PolicyClient
 import msgpack
 import numpy as np
@@ -31,7 +31,7 @@ class Observation:
     control_session: int
     takeover_enabled: bool
     sequence: int
-    image: np.ndarray
+    images: dict[str, np.ndarray]
     joint_positions: dict[str, float]
     task: str
 
@@ -200,10 +200,11 @@ def make_safe_hold_command(command: dict) -> dict:
 
 
 class ObservationSubscriber:
-    def __init__(self, endpoint: str, profile: str):
+    def __init__(self, endpoint: str, profile: str, image_keys: tuple[str, ...]):
         self.endpoint = endpoint
         self.profile = profile
         self.expected_joint_names = PROFILES[profile].joint_names
+        self.expected_image_keys = tuple(image_keys)
         self._context = zmq.Context()
         self._socket = None
 
@@ -222,12 +223,43 @@ class ObservationSubscriber:
         parts = self._socket.recv_multipart()
         while self._socket.poll(0, zmq.POLLIN):
             parts = self._socket.recv_multipart()
-        if len(parts) != 2:
-            raise ValueError(f"RoboJuDo observation has {len(parts)} parts, expected 2")
+        return self._decode_observation(parts)
+
+    def _decode_observation(self, parts: list[bytes]) -> Observation:
+        if not parts:
+            raise ValueError("RoboJuDo observation multipart message is empty")
         header = msgpack.unpackb(parts[0], raw=False)
-        if header.get("protocol_version") != 1:
+        protocol_version = header.get("protocol_version")
+        if protocol_version == 1:
+            image_keys = ("ego_view",)
+            image_shapes = {"ego_view": header.get("shape", ())}
+        elif protocol_version == 2:
+            raw_image_keys = header.get("image_keys")
+            if not isinstance(raw_image_keys, list) or not all(
+                isinstance(key, str) and key for key in raw_image_keys
+            ):
+                raise ValueError("RoboJuDo protocol v2 image_keys must be a list of names")
+            image_keys = tuple(raw_image_keys)
+            raw_image_shapes = header.get("image_shapes", {})
+            if not isinstance(raw_image_shapes, dict):
+                raise ValueError("RoboJuDo protocol v2 image_shapes must be a dictionary")
+            if set(raw_image_shapes) != set(image_keys):
+                raise ValueError(
+                    "RoboJuDo protocol v2 image_shapes keys must exactly match image_keys"
+                )
+            image_shapes = raw_image_shapes
+        else:
+            raise ValueError(f"unsupported RoboJuDo protocol version {protocol_version!r}")
+        if image_keys != self.expected_image_keys:
             raise ValueError(
-                f"unsupported RoboJuDo protocol version {header.get('protocol_version')!r}"
+                f"RoboJuDo observation image order {image_keys} does not match camera layout "
+                f"{self.expected_image_keys}"
+            )
+        expected_part_count = 1 + len(image_keys)
+        if len(parts) != expected_part_count:
+            raise ValueError(
+                f"RoboJuDo observation has {len(parts)} parts, expected {expected_part_count} "
+                f"for images {image_keys}"
             )
         if header.get("profile") != self.profile:
             raise ValueError(
@@ -236,18 +268,23 @@ class ObservationSubscriber:
         joint_names = tuple(header.get("joint_names", ()))
         if joint_names != self.expected_joint_names:
             raise ValueError(
-                "RoboJuDo observation joint order does not match the deployment profile"
+                f"RoboJuDo observation joint order {joint_names} does not match the deployment profile {self.expected_joint_names}"
             )
         positions = np.asarray(header.get("joint_positions"), dtype=np.float32)
         if positions.shape != (len(joint_names),) or not np.isfinite(positions).all():
             raise ValueError("RoboJuDo observation contains invalid joint positions")
-        bgr = cv2.imdecode(np.frombuffer(parts[1], dtype=np.uint8), cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise ValueError("failed to decode RoboJuDo observation JPEG")
-        image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        expected_shape = tuple(header.get("shape", ()))
-        if expected_shape and image.shape != expected_shape:
-            raise ValueError(f"RoboJuDo image shape {image.shape} does not match {expected_shape}")
+        images = {}
+        for key, jpeg in zip(image_keys, parts[1:], strict=True):
+            bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise ValueError(f"failed to decode RoboJuDo observation JPEG for {key!r}")
+            image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            expected_shape = tuple(image_shapes.get(key, ()))
+            if expected_shape and image.shape != expected_shape:
+                raise ValueError(
+                    f"RoboJuDo image {key!r} shape {image.shape} does not match {expected_shape}"
+                )
+            images[key] = image
         task = str(header.get("task", "")).strip()
         if not task:
             raise ValueError("RoboJuDo observation task must not be empty")
@@ -269,7 +306,7 @@ class ObservationSubscriber:
             control_session=control_session,
             takeover_enabled=takeover_enabled,
             sequence=int(header["sequence"]),
-            image=image,
+            images=images,
             joint_positions=dict(zip(joint_names, positions.tolist(), strict=True)),
             task=task,
         )
@@ -299,6 +336,7 @@ class DoubleBufferedPolicyRunner:
         rtc_prefix_schedule: str = "exp",
         rtc_max_guidance_weight: float = 10.0,
         rtc_latency_window: int = 10,
+        video_keys: tuple[str, ...] = CAMERA_LAYOUTS["single"],
     ):
         self.profile = profile
         self.policy_host = policy_host
@@ -314,6 +352,7 @@ class DoubleBufferedPolicyRunner:
         self.rtc_prefix_schedule = rtc_prefix_schedule
         self.rtc_max_guidance_weight = rtc_max_guidance_weight
         self.rtc_latency_window = rtc_latency_window
+        self.video_keys = video_keys
         # Learned from the first full chunk returned by the policy. The action
         # horizon belongs to the checkpoint/embodiment, not to RoboJuDo.
         self._policy_action_horizon: int | None = None
@@ -414,11 +453,12 @@ class DoubleBufferedPolicyRunner:
                 last_sequence = observation.sequence
                 report_observations += 1
                 if first_observation:
+                    image_shapes = {key: image.shape for key, image in observation.images.items()}
                     print(
                         f"Received first observation: sequence={observation.sequence}, "
                         f"session={observation.control_session}, "
                         f"takeover_enabled={observation.takeover_enabled}, "
-                        f"image={observation.image.shape}, joints={len(observation.joint_positions)}",
+                        f"images={image_shapes}, joints={len(observation.joint_positions)}",
                         flush=True,
                     )
                     first_observation = False
@@ -434,7 +474,7 @@ class DoubleBufferedPolicyRunner:
 
     def _inference_loop(self):
         client = PolicyClient(host=self.policy_host, port=self.policy_port)
-        adapter = RoboJuDoPolicyAdapter(client, self.profile)
+        adapter = RoboJuDoPolicyAdapter(client, self.profile, self.video_keys)
         try:
             if not client.ping():
                 raise ConnectionError(
@@ -528,7 +568,7 @@ class DoubleBufferedPolicyRunner:
                             }
                         }
                     policy_chunk = adapter.get_action_chunk(
-                        image=observation.image,
+                        images=observation.images,
                         joint_positions=observation.joint_positions,
                         instruction=instruction,
                         execution_horizon=None,
@@ -538,7 +578,7 @@ class DoubleBufferedPolicyRunner:
                     physical_actions = policy_chunk.actions
                 else:
                     policy_chunk = adapter.get_action_chunk(
-                        image=observation.image,
+                        images=observation.images,
                         joint_positions=observation.joint_positions,
                         instruction=instruction,
                         execution_horizon=None,
@@ -708,11 +748,18 @@ class DoubleBufferedPolicyRunner:
                 # Handle observation timeout, control takeover, and session/task changes
                 if not observation_fresh:
                     if observation_was_fresh:
-                        print(
-                            "RoboJuDo observation timed out; command publishing stopped", flush=True
-                        )
+                        if last_command is None or active_session is None:
+                            print(
+                                "RoboJuDo observation timed out; no previous command to hold",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                "RoboJuDo observation timed out; holding arm/height and "
+                                "setting vx/vy/yaw_rate to zero",
+                                flush=True,
+                            )
                     active_commands.clear()
-                    last_command = None
                     self._pending_commands = None
                     self._ready_chunks.clear()
                     self._rtc_queue.clear()
@@ -720,10 +767,16 @@ class DoubleBufferedPolicyRunner:
                     if temporal_ensembler is not None:
                         temporal_ensembler.reset()
                     self._control_tick = 0
-                    self._control_tick_session = None
-                    holding_last_command = False
-                    active_session = None
-                    active_task = None
+                    if last_command is not None and active_session is not None:
+                        last_command = make_safe_hold_command(last_command)
+                        self._control_tick_session = active_session
+                        holding_last_command = True
+                    else:
+                        last_command = None
+                        self._control_tick_session = None
+                        holding_last_command = False
+                        active_session = None
+                        active_task = None
                 elif not observation_was_fresh:
                     print("RoboJuDo observation stream is fresh", flush=True)
                 if observation_fresh and not control_enabled:
@@ -983,6 +1036,12 @@ class DoubleBufferedPolicyRunner:
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=sorted(PROFILES), required=True)
+    parser.add_argument(
+        "--camera-layout",
+        choices=sorted(CAMERA_LAYOUTS),
+        default="single",
+        help="Expected observation image layout; mulcam requires protocol v2",
+    )
     parser.add_argument("--robot-endpoint", required=True, help="RoboJuDo observation endpoint")
     parser.add_argument("--command-endpoint", default="tcp://*:8559")
     parser.add_argument("--policy-host", default="127.0.0.1")
@@ -1031,6 +1090,8 @@ def parse_args():
     parser.add_argument("--status-interval", type=float, default=5.0)
     parser.add_argument("--task", default=None, help="Override the task sent by RoboJuDo")
     args = parser.parse_args()
+    if args.camera_layout == "mulcam" and args.profile != "g1_23dof":
+        parser.error("--camera-layout=mulcam is currently supported only for --profile=g1_23dof")
     if args.execution_horizon < 1:
         parser.error("--execution-horizon must be positive")
     if args.command_fps <= 0:
@@ -1052,11 +1113,13 @@ def main():
     args = parse_args()
     print(
         f"Starting RoboJuDo deploy client: profile={args.profile}, "
+        f"camera_layout={args.camera_layout}, "
         f"mode={args.execution_mode}, observations={args.robot_endpoint}, "
         f"commands={args.command_endpoint}",
         flush=True,
     )
-    subscriber = ObservationSubscriber(args.robot_endpoint, args.profile)
+    video_keys = CAMERA_LAYOUTS[args.camera_layout]
+    subscriber = ObservationSubscriber(args.robot_endpoint, args.profile, video_keys)
     runner = DoubleBufferedPolicyRunner(
         profile=args.profile,
         policy_host=args.policy_host,
@@ -1073,6 +1136,7 @@ def main():
         rtc_prefix_schedule=args.rtc_prefix_schedule,
         rtc_max_guidance_weight=args.rtc_max_guidance_weight,
         rtc_latency_window=args.rtc_latency_window,
+        video_keys=video_keys,
     )
     try:
         runner.run()
