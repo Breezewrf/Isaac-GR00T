@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run a selectable asynchronous RoboJuDo observation-to-command deployment loop."""
+"""Run a selectable RoboJuDo observation-to-command deployment loop."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import zmq
 from zmq.utils.monitor import recv_monitor_message
 
 
-EXECUTION_MODES = ("double_buffer", "temporal_ensemble", "rtc")
+EXECUTION_MODES = ("sync", "double_buffer", "temporal_ensemble", "rtc")
 RTC_PREFIX_SCHEDULES = ("zeros", "ones", "linear", "exp")
 
 
@@ -364,6 +364,11 @@ class DoubleBufferedPolicyRunner:
         self._last_inferred_session: tuple[str, int] | None = None
         self._last_inferred_sequence = -1
         self._pending_commands: ActionChunk | None = None
+        # In sync mode, inference may start only when the previously returned
+        # chunk has finished executing.  The flag is cleared after the final
+        # command has actually been published, not when it is removed from the
+        # local queue.
+        self._sync_chunk_active = False
         self._ready_chunks: deque[ActionChunk] = deque()
         self._rtc_queue = RTCActionQueue()
         # Store the last N inference latencies for RTC mode to estimate the delay steps
@@ -493,7 +498,15 @@ class DoubleBufferedPolicyRunner:
                             or (
                                 (
                                     self.execution_mode in ("temporal_ensemble", "rtc")
-                                    or self._pending_commands is None
+                                    or (
+                                        self.execution_mode == "sync"
+                                        and not self._sync_chunk_active
+                                        and self._pending_commands is None
+                                    )
+                                    or (
+                                        self.execution_mode == "double_buffer"
+                                        and self._pending_commands is None
+                                    )
                                 )
                                 and self._latest_observation is not None
                                 and self._latest_observation.takeover_enabled
@@ -731,6 +744,7 @@ class DoubleBufferedPolicyRunner:
             ready_chunks = []
             rtc_command = None
             current_tick = 0
+            sync_chunk_finished = False
             with self._condition:
                 if self._error is not None:
                     raise RuntimeError("RoboJuDo deployment worker failed") from self._error
@@ -761,6 +775,7 @@ class DoubleBufferedPolicyRunner:
                             )
                     active_commands.clear()
                     self._pending_commands = None
+                    self._sync_chunk_active = False
                     self._ready_chunks.clear()
                     self._rtc_queue.clear()
                     self._rtc_inference_latencies.clear()
@@ -789,6 +804,7 @@ class DoubleBufferedPolicyRunner:
                     active_commands.clear()
                     last_command = None
                     self._pending_commands = None
+                    self._sync_chunk_active = False
                     self._ready_chunks.clear()
                     self._rtc_queue.clear()
                     self._rtc_inference_latencies.clear()
@@ -809,6 +825,7 @@ class DoubleBufferedPolicyRunner:
                     holding_last_command = False
                     active_session = current_session
                     active_task = current_task
+                    self._sync_chunk_active = False
                     self._control_tick = 0
                     self._control_tick_session = current_session
                     if temporal_ensembler is not None:
@@ -829,12 +846,16 @@ class DoubleBufferedPolicyRunner:
                         if self._pending_commands is not None
                         else None
                     )
-                    if self._pending_commands is not None and pending_session != current_session:
+                    if self._pending_commands is not None and (
+                        pending_session != current_session
+                        or self._pending_commands.task != current_task
+                    ):
                         self._pending_commands = None
                     self._ready_chunks = deque(
                         chunk
                         for chunk in self._ready_chunks
                         if (chunk.stream_id, chunk.control_session) == current_session
+                        and chunk.task == current_task
                     )
                     self._condition.notify_all()
                     print(
@@ -843,7 +864,7 @@ class DoubleBufferedPolicyRunner:
                         flush=True,
                     )
                 if (
-                    self.execution_mode == "double_buffer"
+                    self.execution_mode in ("sync", "double_buffer")
                     and control_enabled
                     and not active_commands
                     and self._pending_commands is not None
@@ -861,6 +882,8 @@ class DoubleBufferedPolicyRunner:
                         )
                     elif chunk_age <= self.observation_timeout:
                         active_commands.extend(chunk.commands)
+                        if self.execution_mode == "sync":
+                            self._sync_chunk_active = True
                         holding_last_command = False
                         print(
                             f"[command] activated chunk: observation_sequence={chunk.observation_sequence}, "
@@ -938,6 +961,21 @@ class DoubleBufferedPolicyRunner:
                         )
                     last_command = make_safe_hold_command(last_command)
                     holding_last_command = True
+            elif self.execution_mode == "sync":
+                if active_commands:
+                    last_command = active_commands.popleft()
+                    sync_chunk_finished = not active_commands
+                    holding_last_command = False
+                elif last_command is not None:
+                    if not holding_last_command:
+                        print(
+                            "[command] synchronous action horizon exhausted; holding "
+                            "upper-body pose/height and setting vx/vy/yaw_rate to zero "
+                            "until the next chunk is ready",
+                            flush=True,
+                        )
+                    last_command = make_safe_hold_command(last_command)
+                    holding_last_command = True
             else:
                 if active_commands:
                     last_command = active_commands.popleft()
@@ -973,6 +1011,12 @@ class DoubleBufferedPolicyRunner:
                 with self._condition:
                     if self._control_tick_session == active_session:
                         self._control_tick += 1
+                    if sync_chunk_finished:
+                        # Wake inference only after the final command in the
+                        # current chunk has been published.  Until its result
+                        # arrives, subsequent control ticks publish safe hold.
+                        self._sync_chunk_active = False
+                        self._condition.notify_all()
             report_now = time.monotonic()
             report_elapsed = report_now - report_started_at
             if report_elapsed >= self.status_interval:
@@ -1000,6 +1044,13 @@ class DoubleBufferedPolicyRunner:
                         f"control_tick={current_tick}, rtc_queue_remaining={rtc_queue_size}, "
                         f"holding={holding_last_command}, "
                         f"latency_samples={len(self._rtc_inference_latencies)}"
+                    )
+                elif self.execution_mode == "sync":
+                    mode_status = (
+                        f"chunk_remaining={len(active_commands)}, "
+                        f"holding={holding_last_command}, "
+                        f"chunk_active={self._sync_chunk_active}, "
+                        f"inference_chunk_pending={inference_pending}"
                     )
                 else:
                     mode_status = (
@@ -1050,7 +1101,10 @@ def parse_args():
         "--execution-mode",
         choices=EXECUTION_MODES,
         default="double_buffer",
-        help="Action execution strategy; RTC continuously replaces a guided action queue",
+        help=(
+            "Action execution strategy; sync waits for each chunk before continuing, "
+            "while RTC continuously replaces a guided action queue"
+        ),
     )
     parser.add_argument(
         "--execution-horizon",

@@ -231,6 +231,26 @@ checkpoints. A layout mismatch fails before policy inference instead of silently
 
 ### Execution modes
 
+The **synchronous** mode performs no action-chunk prefetching. It executes the configured horizon,
+then blocks on inference from the latest observation. While the next chunk is being generated, the
+client continues publishing at `--command-fps`: upper-body joint targets and base height remain at
+their last commanded values, while `vx`, `vy`, and `yaw_rate` are forced to zero.
+
+```bash
+uv run python examples/RoboJuDo/run_robojudo_client.py \
+  --profile x2 \
+  --robot-endpoint tcp://127.0.0.1:8561 \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --command-endpoint tcp://*:8559 \
+  --execution-mode sync \
+  --execution-horizon 8
+```
+
+Before the first chunk is available, the client has no trusted pose target and does not publish a
+command. Observation timeout, takeover disable, and stream/session/task changes discard buffered
+commands and prevent an outdated inference result from becoming active.
+
 The default preserves the original **asynchronous double-buffer** behavior:
 
 ```bash
