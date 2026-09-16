@@ -26,6 +26,9 @@ COLOR_JITTER_PARAMS="${COLOR_JITTER_PARAMS:-brightness 0.3 contrast 0.4 saturati
 USE_PERCENTILES=""
 SHORTEST_IMAGE_EDGE=""
 CROP_FRACTION=""
+TRAINING_TIME_RTC=0
+RTC_MAX_DELAY_STEPS=8
+RTC_CONDITION_PROB=1.0
 EXTRA_ARGS=()
 
 usage() {
@@ -41,6 +44,9 @@ Usage: bash examples/finetune.sh \
   [--use-percentiles <true|false>] \
   [--shortest-image-edge <pixels>] \
   [--crop-fraction <fraction>] \
+  [--training-time-rtc] \
+  [--rtc-max-delay-steps <steps>] \
+  [--rtc-condition-prob <probability>] \
   [--ds-weights-alpha <value>] \
   [--save-only-model] \
   [--resume-from-checkpoint] \
@@ -96,6 +102,18 @@ while [ "$#" -gt 0 ]; do
             ;;
         --crop-fraction)
             CROP_FRACTION="$2"
+            shift 2
+            ;;
+        --training-time-rtc)
+            TRAINING_TIME_RTC=1
+            shift
+            ;;
+        --rtc-max-delay-steps)
+            RTC_MAX_DELAY_STEPS="$2"
+            shift 2
+            ;;
+        --rtc-condition-prob)
+            RTC_CONDITION_PROB="$2"
             shift 2
             ;;
         --ds-weights-alpha)
@@ -198,6 +216,13 @@ if [ -n "$SHORTEST_IMAGE_EDGE" ]; then
 fi
 if [ -n "$CROP_FRACTION" ]; then
     LAUNCH_CMD+=(--crop-fraction "$CROP_FRACTION")
+fi
+if [ "$TRAINING_TIME_RTC" = "1" ]; then
+    LAUNCH_CMD+=(
+        --training-time-rtc
+        --rtc-max-delay-steps "$RTC_MAX_DELAY_STEPS"
+        --rtc-condition-prob "$RTC_CONDITION_PROB"
+    )
 fi
 if [ -n "$DS_WEIGHTS_ALPHA" ]; then
     LAUNCH_CMD+=(--ds_weights_alpha "$DS_WEIGHTS_ALPHA")

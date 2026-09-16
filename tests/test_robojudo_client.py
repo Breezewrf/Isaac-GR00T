@@ -243,6 +243,20 @@ def test_parse_args_accepts_horizon_above_previous_fixed_limit():
         assert client_module.parse_args().execution_horizon == 32
 
 
+def test_parse_args_accepts_sync_execution_mode():
+    argv = [
+        "run_robojudo_client.py",
+        "--profile",
+        "x2",
+        "--robot-endpoint",
+        "tcp://127.0.0.1:8561",
+        "--execution-mode",
+        "sync",
+    ]
+    with patch.object(sys, "argv", argv):
+        assert client_module.parse_args().execution_mode == "sync"
+
+
 def test_parse_args_rejects_non_positive_horizon():
     argv = [
         "run_robojudo_client.py",
@@ -414,6 +428,76 @@ def test_inference_discards_disabled_session_and_uses_reenabled_session():
 
     assert not inference_thread.is_alive()
     assert inference_calls == 2
+
+
+def test_sync_inference_waits_for_active_chunk_to_finish():
+    inference_called = threading.Event()
+
+    class FakePolicyClient:
+        def __init__(self, host, port):
+            del host, port
+
+        def ping(self):
+            return True
+
+        def close(self):
+            return None
+
+    class FakeAdapter:
+        def __init__(self, policy_client, profile, video_keys):
+            del policy_client, profile, video_keys
+
+        def get_action_chunk(self, **kwargs):
+            del kwargs
+            inference_called.set()
+            return SimpleNamespace(commands=[_command("joint", 1.0)])
+
+    runner = client_module.DoubleBufferedPolicyRunner.__new__(
+        client_module.DoubleBufferedPolicyRunner
+    )
+    runner.policy_host = "test"
+    runner.policy_port = 0
+    runner.profile = "x2"
+    runner.task_override = None
+    runner.execution_horizon = 1
+    runner.execution_mode = "sync"
+    runner.video_keys = adapter_module.CAMERA_LAYOUTS["single"]
+    runner._condition = threading.Condition()
+    runner._stopping = False
+    runner._error = None
+    runner._latest_observation = _observation(session=1, enabled=True, sequence=1)
+    runner._latest_observation_at = time.monotonic()
+    runner._last_inferred_session = None
+    runner._last_inferred_sequence = -1
+    runner._pending_commands = None
+    runner._sync_chunk_active = True
+    runner._ready_chunks = deque()
+    runner._control_tick = 0
+    runner._control_tick_session = ("test-stream", 1)
+
+    with (
+        patch.object(client_module, "PolicyClient", FakePolicyClient),
+        patch.object(client_module, "RoboJuDoPolicyAdapter", FakeAdapter),
+    ):
+        inference_thread = threading.Thread(target=runner._inference_loop)
+        inference_thread.start()
+        assert not inference_called.wait(timeout=0.05)
+
+        with runner._condition:
+            runner._sync_chunk_active = False
+            runner._condition.notify_all()
+        assert inference_called.wait(timeout=1)
+
+        with runner._condition:
+            assert runner._condition.wait_for(
+                lambda: runner._pending_commands is not None,
+                timeout=1,
+            )
+            runner._stopping = True
+            runner._condition.notify_all()
+        inference_thread.join(timeout=1)
+
+    assert not inference_thread.is_alive()
 
 
 def test_temporal_ensemble_inference_does_not_wait_for_ready_queue_to_drain():

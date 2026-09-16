@@ -181,6 +181,10 @@ class Gr00tN1d7ActionHead(nn.Module):
             torch.tensor(float(config.noise_beta_beta), dtype=torch.float32, device="cpu"),
         )
         self.num_timestep_buckets = config.num_timestep_buckets
+        if config.rtc_max_delay_steps < 0:
+            raise ValueError("rtc_max_delay_steps must be non-negative")
+        if not 0.0 <= config.rtc_condition_prob <= 1.0:
+            raise ValueError("rtc_condition_prob must be in [0, 1]")
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
@@ -239,6 +243,89 @@ class Gr00tN1d7ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
+    def _sample_rtc_delays(self, action_mask: torch.Tensor) -> torch.Tensor:
+        """Sample an inclusive RTC delay for every item in the batch."""
+        valid_steps = action_mask.bool().any(dim=-1).sum(dim=-1)
+        if torch.any(valid_steps < 1):
+            raise ValueError("Training-time RTC requires at least one valid action timestep")
+
+        configured_max = torch.full_like(valid_steps, self.config.rtc_max_delay_steps)
+        # Always retain at least one valid postfix action to supervise.
+        max_delays = torch.minimum(configured_max, valid_steps - 1).clamp_min(0)
+        delays = torch.floor(
+            torch.rand(valid_steps.shape, device=action_mask.device) * (max_delays + 1)
+        ).long()
+
+        if self.config.rtc_condition_prob < 1.0:
+            use_conditioning = (
+                torch.rand(valid_steps.shape, device=action_mask.device)
+                < self.config.rtc_condition_prob
+            )
+            delays = torch.where(use_conditioning, delays, torch.zeros_like(delays))
+        return delays
+
+    def _prepare_flow_training_inputs(
+        self,
+        actions: torch.Tensor,
+        action_mask: torch.Tensor,
+        rtc_delays: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Create flow-matching inputs, including clean RTC action prefixes."""
+        batch_size, horizon, _ = actions.shape
+        noise = torch.randn_like(actions)
+        flow_time = self.sample_time(batch_size, device=actions.device, dtype=actions.dtype)
+        action_times = flow_time[:, None].expand(-1, horizon).clone()
+        prefix_mask = torch.zeros((batch_size, horizon), dtype=torch.bool, device=actions.device)
+        loss_mask = action_mask
+
+        if self.config.training_time_rtc:
+            if rtc_delays is None:
+                rtc_delays = self._sample_rtc_delays(action_mask)
+            else:
+                rtc_delays = rtc_delays.to(device=actions.device, dtype=torch.long)
+                if rtc_delays.shape != (batch_size,):
+                    raise ValueError(
+                        f"rtc_delays must have shape ({batch_size},), got {tuple(rtc_delays.shape)}"
+                    )
+                valid_steps = action_mask.bool().any(dim=-1).sum(dim=-1)
+                max_delays = torch.minimum(
+                    torch.full_like(valid_steps, self.config.rtc_max_delay_steps),
+                    valid_steps - 1,
+                ).clamp_min(0)
+                if torch.any(rtc_delays < 0) or torch.any(rtc_delays > max_delays):
+                    raise ValueError("rtc_delays exceeds the configured or valid action horizon")
+
+            prefix_mask = (
+                torch.arange(horizon, device=actions.device)[None, :] < rtc_delays[:, None]
+            )
+            # This flow runs from noise at t=0 to data at t=1. Prefix actions are
+            # known conditions, so they are placed exactly at the clean endpoint.
+            action_times = torch.where(prefix_mask, torch.ones_like(action_times), action_times)
+            loss_mask = action_mask * (~prefix_mask[:, :, None]).to(action_mask.dtype)
+        else:
+            rtc_delays = torch.zeros(batch_size, dtype=torch.long, device=actions.device)
+
+        noisy_trajectory = (1 - action_times[:, :, None]) * noise + action_times[
+            :, :, None
+        ] * actions
+        velocity = actions - noise
+
+        global_timestep = (flow_time * self.num_timestep_buckets).long()
+        action_timesteps = (action_times * self.num_timestep_buckets).long()
+        if not self.config.training_time_rtc:
+            # Preserve the original non-RTC call contract and numerical path.
+            action_timesteps = global_timestep
+
+        return {
+            "noisy_trajectory": noisy_trajectory,
+            "velocity": velocity,
+            "global_timestep": global_timestep,
+            "action_timesteps": action_timesteps,
+            "loss_mask": loss_mask,
+            "prefix_mask": prefix_mask,
+            "rtc_delays": rtc_delays,
+        }
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
@@ -292,18 +379,14 @@ class Gr00tN1d7ActionHead(nn.Module):
             do_dropout = do_dropout[:, None, None].to(dtype=state_features.dtype)
             state_features = state_features * (1 - do_dropout)
 
-        # Embed noised action trajectory.
+        # Embed the noised action trajectory. With training-time RTC enabled,
+        # prefix tokens contain clean actions at the terminal flow timestep and
+        # only postfix tokens contribute to the loss.
         actions = action_input.action
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
-
-        noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
-
-        # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+        flow_inputs = self._prepare_flow_training_inputs(actions, action_input.action_mask)
+        action_features = self.action_encoder(
+            flow_inputs["noisy_trajectory"], flow_inputs["action_timesteps"], embodiment_id
+        )
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
@@ -322,7 +405,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
+                timestep=flow_inputs["global_timestep"],
                 return_all_hidden_states=True,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
@@ -332,7 +415,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
+                timestep=flow_inputs["global_timestep"],
                 return_all_hidden_states=True,
             )
 
@@ -340,14 +423,17 @@ class Gr00tN1d7ActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        action_mask = action_input.action_mask
-        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        loss_mask = flow_inputs["loss_mask"]
+        action_loss = (
+            F.mse_loss(pred_actions, flow_inputs["velocity"], reduction="none") * loss_mask
+        )
+        loss = action_loss.sum() / (loss_mask.sum() + 1e-6)
 
         return {
             "loss": loss,
             "action_loss": action_loss,
-            "action_mask": action_mask,
+            "action_mask": loss_mask,
+            "rtc_delays": flow_inputs["rtc_delays"].detach(),
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
@@ -423,37 +509,58 @@ class Gr00tN1d7ActionHead(nn.Module):
         vel_strength = torch.ones_like(actions)
         rtc_options = options.get("rtc") if options is not None else None
         rtc_prefix = None
+        rtc_prefix_mask = None
         rtc_weights = None
+        rtc_mode = None
 
         if rtc_options is not None:
             if "action" not in action_input:
                 raise ValueError("RTC requires a normalized action prefix")
+            rtc_mode = str(rtc_options.get("mode", "inference_guidance"))
+            if rtc_mode not in ("inference_guidance", "training_time"):
+                raise ValueError(f"Unsupported RTC mode {rtc_mode!r}")
             prefix_length = int(rtc_options["prefix_length"])
             frozen_steps = min(int(rtc_options["estimated_delay_steps"]), prefix_length)
-            guidance_horizon = min(int(rtc_options["guidance_horizon"]), prefix_length)
             if not 0 < prefix_length <= self.action_horizon:
                 raise ValueError(
                     f"RTC prefix_length must be in [1, {self.action_horizon}], got {prefix_length}"
                 )
-            if not 0 <= frozen_steps <= guidance_horizon:
-                raise ValueError(
-                    "RTC horizons must satisfy 0 <= estimated_delay_steps <= "
-                    "guidance_horizon after prefix clipping"
-                )
             rtc_prefix = action_input["action"][:, : self.action_horizon].detach()
-            prefix_weights = get_rtc_prefix_weights(
-                frozen_steps,
-                guidance_horizon,
-                self.action_horizon,
-                str(rtc_options.get("prefix_schedule", "exp")),
-                device=device,
-                dtype=actions.dtype,
-            )
-            rtc_weights = prefix_weights[None, :, None]
-            if "action_mask" in action_input:
-                rtc_weights = rtc_weights * action_input["action_mask"][
-                    :, : self.action_horizon
-                ].to(dtype=actions.dtype)
+
+            if rtc_mode == "training_time":
+                if not self.config.training_time_rtc:
+                    raise ValueError(
+                        "Training-time RTC inference requires a checkpoint configured with "
+                        "training_time_rtc=True"
+                    )
+                if frozen_steps > self.config.rtc_max_delay_steps:
+                    raise ValueError(
+                        f"RTC delay {frozen_steps} exceeds the trained maximum "
+                        f"{self.config.rtc_max_delay_steps}"
+                    )
+                rtc_prefix_mask = (
+                    torch.arange(self.action_horizon, device=device)[None, :] < frozen_steps
+                )
+            else:
+                guidance_horizon = min(int(rtc_options["guidance_horizon"]), prefix_length)
+                if not 0 <= frozen_steps <= guidance_horizon:
+                    raise ValueError(
+                        "RTC horizons must satisfy 0 <= estimated_delay_steps <= "
+                        "guidance_horizon after prefix clipping"
+                    )
+                prefix_weights = get_rtc_prefix_weights(
+                    frozen_steps,
+                    guidance_horizon,
+                    self.action_horizon,
+                    str(rtc_options.get("prefix_schedule", "exp")),
+                    device=device,
+                    dtype=actions.dtype,
+                )
+                rtc_weights = prefix_weights[None, :, None]
+                if "action_mask" in action_input:
+                    rtc_weights = rtc_weights * action_input["action_mask"][
+                        :, : self.action_horizon
+                    ].to(dtype=actions.dtype)
 
         elif "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
@@ -493,9 +600,13 @@ class Gr00tN1d7ActionHead(nn.Module):
                 :,
             ] = ramp[None, :, None].to(device)
 
-        def predict_velocity(current_actions: torch.Tensor, timesteps_tensor: torch.Tensor):
+        def predict_velocity(
+            current_actions: torch.Tensor,
+            action_timesteps: torch.Tensor,
+            dit_timestep: torch.Tensor,
+        ):
             """Run one denoising network evaluation."""
-            action_features = self.action_encoder(current_actions, timesteps_tensor, embodiment_id)
+            action_features = self.action_encoder(current_actions, action_timesteps, embodiment_id)
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 action_features = action_features + self.position_embedding(pos_ids).unsqueeze(0)
@@ -504,7 +615,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
+                    timestep=dit_timestep,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
                 )
@@ -512,7 +623,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
+                    timestep=dit_timestep,
                 )
             pred = self.action_decoder(model_output, embodiment_id)
             return pred[:, -self.action_horizon :]
@@ -525,9 +636,20 @@ class Gr00tN1d7ActionHead(nn.Module):
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            pred_velocity = predict_velocity(actions, timesteps_tensor)
 
-            if rtc_prefix is not None:
+            action_timesteps = timesteps_tensor
+            if rtc_mode == "training_time":
+                actions = torch.where(rtc_prefix_mask[:, :, None], rtc_prefix, actions)
+                action_timesteps = timesteps_tensor[:, None].expand(-1, self.action_horizon)
+                action_timesteps = torch.where(
+                    rtc_prefix_mask,
+                    torch.full_like(action_timesteps, self.num_timestep_buckets),
+                    action_timesteps,
+                )
+
+            pred_velocity = predict_velocity(actions, action_timesteps, timesteps_tensor)
+
+            if rtc_mode == "inference_guidance":
                 max_guidance_weight = float(rtc_options.get("max_guidance_weight", 10.0))
                 # LeRobot intentionally treats the denoiser output as fixed while taking
                 # this gradient. This computes the same vector-Jacobian correction without
@@ -549,6 +671,11 @@ class Gr00tN1d7ActionHead(nn.Module):
 
             # Update actions using euler integration.
             actions = (actions + dt * pred_velocity * vel_strength).detach()
+
+        if rtc_mode == "training_time":
+            # Keep the API contract explicit even though an asynchronous controller
+            # normally skips these already-committed actions after the chunk swap.
+            actions = torch.where(rtc_prefix_mask[:, :, None], rtc_prefix, actions)
 
         return BatchFeature(
             data={

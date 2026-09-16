@@ -203,6 +203,30 @@ class TestGr00tPolicyGetAction:
         assert model_options["rtc"]["estimated_delay_steps"] == 2
         assert info["rtc"] == model_options["rtc"]
 
+    def test_training_time_rtc_does_not_require_guidance_options(self, policy):
+        prefix_actions = {
+            key: np.arange(4, dtype=np.float32).reshape(1, 4, 1) for key in ACTION_KEYS
+        }
+
+        actions, model_options = policy._prepare_rtc_options(
+            {
+                "rtc": {
+                    "mode": "training_time",
+                    "prefix_actions": prefix_actions,
+                    "prefix_length": 4,
+                    "estimated_delay_steps": 2,
+                }
+            },
+            batch_size=1,
+        )
+
+        assert actions is not None
+        assert model_options["rtc"] == {
+            "mode": "training_time",
+            "prefix_length": 4,
+            "estimated_delay_steps": 2,
+        }
+
 
 class _NumpyLanguageSimPolicy:
     def __init__(self):

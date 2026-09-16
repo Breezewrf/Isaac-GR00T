@@ -109,6 +109,13 @@ class Gr00tN1d7Config(PretrainedConfig):
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
 
+    # Training-time real-time chunking (RTC). During training, a random clean
+    # action prefix is provided as context and the flow-matching loss is only
+    # computed on the remaining postfix. ``rtc_max_delay_steps`` is inclusive.
+    training_time_rtc: bool = False
+    rtc_max_delay_steps: int = 8
+    rtc_condition_prob: float = 1.0
+
     # Training parameters
     tune_projector: bool = True
     tune_diffusion_model: bool = True

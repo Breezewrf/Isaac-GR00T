@@ -58,6 +58,15 @@ class FinetuneConfig:
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
 
+    training_time_rtc: bool = False
+    """Train the action head to condition on clean, already-committed action prefixes."""
+
+    rtc_max_delay_steps: int = 8
+    """Maximum simulated RTC delay in action steps, inclusive."""
+
+    rtc_condition_prob: float = 1.0
+    """Probability that a training sample uses a randomly sampled RTC prefix."""
+
     state_dropout_prob: float = 0.2
     """
     Dropout probability applied to state inputs for regularization during training.
@@ -197,6 +206,12 @@ class FinetuneConfig:
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
     def __post_init__(self) -> None:
+        if self.rtc_max_delay_steps < 0:
+            raise ValueError(
+                f"rtc_max_delay_steps must be non-negative, got {self.rtc_max_delay_steps}"
+            )
+        if not 0.0 <= self.rtc_condition_prob <= 1.0:
+            raise ValueError(f"rtc_condition_prob must be in [0, 1], got {self.rtc_condition_prob}")
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"

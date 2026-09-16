@@ -127,6 +127,48 @@ class TestActionHeadForward:
         out = head.forward(_make_backbone_output(config), _make_action_input(config))
         assert torch.isfinite(out["loss"])
 
+    def test_training_time_rtc_uses_clean_prefix_and_postfix_loss(self):
+        config = _small_config(training_time_rtc=True, rtc_max_delay_steps=2)
+        head = Gr00tN1d7ActionHead(config)
+        actions = torch.randn(2, config.action_horizon, config.max_action_dim)
+        action_mask = torch.ones_like(actions)
+        action_mask[1, 3:] = 0
+
+        prepared = head._prepare_flow_training_inputs(
+            actions,
+            action_mask,
+            rtc_delays=torch.tensor([2, 1]),
+        )
+
+        torch.testing.assert_close(prepared["noisy_trajectory"][0, :2], actions[0, :2])
+        torch.testing.assert_close(prepared["noisy_trajectory"][1, :1], actions[1, :1])
+        assert torch.all(prepared["action_timesteps"][0, :2] == config.num_timestep_buckets)
+        assert torch.all(prepared["action_timesteps"][1, :1] == config.num_timestep_buckets)
+        assert torch.count_nonzero(prepared["loss_mask"][0, :2]) == 0
+        assert torch.count_nonzero(prepared["loss_mask"][1, :1]) == 0
+        torch.testing.assert_close(prepared["loss_mask"][0, 2:], action_mask[0, 2:])
+        torch.testing.assert_close(prepared["loss_mask"][1, 1:], action_mask[1, 1:])
+
+    def test_training_time_rtc_keeps_one_postfix_step(self):
+        config = _small_config(training_time_rtc=True, rtc_max_delay_steps=10)
+        head = Gr00tN1d7ActionHead(config)
+        action_mask = torch.ones(64, config.action_horizon, config.max_action_dim)
+
+        delays = head._sample_rtc_delays(action_mask)
+
+        assert torch.all(delays >= 0)
+        assert torch.all(delays <= config.action_horizon - 1)
+
+    def test_action_encoder_accepts_per_action_timesteps(self):
+        config = _small_config()
+        head = Gr00tN1d7ActionHead(config)
+        actions = torch.randn(2, config.action_horizon, config.max_action_dim)
+        timesteps = torch.randint(0, config.num_timestep_buckets, (2, config.action_horizon))
+
+        encoded = head.action_encoder(actions, timesteps, torch.zeros(2, dtype=torch.long))
+
+        assert encoded.shape == (2, config.action_horizon, config.input_embedding_dim)
+
 
 class TestActionHeadGetAction:
     """Test inference (denoising loop)."""
@@ -191,6 +233,52 @@ class TestActionHeadGetAction:
 
         torch.testing.assert_close(guided, ordinary)
         assert not guided.requires_grad
+
+    def test_training_time_rtc_preserves_hard_prefix_without_grad(self, monkeypatch):
+        config = _small_config(
+            training_time_rtc=True,
+            rtc_max_delay_steps=2,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        head.eval()
+        action_input = _make_action_input(config, batch_size=1)
+        expected_prefix = action_input["action"][:, :2].clone()
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("training-time RTC must not call torch.autograd.grad")
+
+        monkeypatch.setattr(torch.autograd, "grad", fail_if_called)
+        out = head.get_action(
+            _make_backbone_output(config, batch_size=1),
+            action_input,
+            options={
+                "rtc": {
+                    "mode": "training_time",
+                    "prefix_length": config.action_horizon,
+                    "estimated_delay_steps": 2,
+                }
+            },
+        )
+
+        torch.testing.assert_close(out["action_pred"][:, :2], expected_prefix)
+        assert not out["action_pred"].requires_grad
+
+    def test_training_time_rtc_rejects_untrained_checkpoint(self, action_head):
+        head, config = action_head
+        action_input = _make_action_input(config, batch_size=1)
+
+        with pytest.raises(ValueError, match="training_time_rtc=True"):
+            head.get_action(
+                _make_backbone_output(config, batch_size=1),
+                action_input,
+                options={
+                    "rtc": {
+                        "mode": "training_time",
+                        "prefix_length": config.action_horizon,
+                        "estimated_delay_steps": 2,
+                    }
+                },
+            )
 
 
 class TestRTCUtilities:

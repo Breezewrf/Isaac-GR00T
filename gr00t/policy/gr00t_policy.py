@@ -280,38 +280,50 @@ class Gr00tPolicy(BasePolicy):
                 action = np.concatenate((action, padding), axis=0)
             per_sample_actions[key] = action
 
+        mode = rtc.get("mode", "inference_guidance")
+        if mode not in ("inference_guidance", "training_time"):
+            raise ValueError(f"Unsupported RTC mode {mode!r}")
+
         estimated_delay = rtc.get("estimated_delay_steps")
-        guidance_horizon = rtc.get("guidance_horizon")
-        for name, value in (
-            ("estimated_delay_steps", estimated_delay),
-            ("guidance_horizon", guidance_horizon),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise ValueError(f"RTC {name} must be an integer")
-        if not 0 <= estimated_delay <= guidance_horizon <= action_horizon:
+        if isinstance(estimated_delay, bool) or not isinstance(estimated_delay, int):
+            raise ValueError("RTC estimated_delay_steps must be an integer")
+        if not 0 <= estimated_delay <= prefix_length:
             raise ValueError(
-                "RTC horizons must satisfy 0 <= estimated_delay_steps <= "
-                f"guidance_horizon <= {action_horizon}"
+                f"RTC estimated_delay_steps must be in [0, {prefix_length}], got {estimated_delay}"
             )
-        prefix_schedule = rtc.get("prefix_schedule", "exp")
-        if prefix_schedule not in ("zeros", "ones", "linear", "exp"):
-            raise ValueError(f"Unsupported RTC prefix_schedule {prefix_schedule!r}")
-        max_guidance_weight = rtc.get("max_guidance_weight", 10.0)
-        if (
-            isinstance(max_guidance_weight, bool)
-            or not isinstance(max_guidance_weight, (int, float))
-            or not np.isfinite(max_guidance_weight)
-            or max_guidance_weight < 0
-        ):
-            raise ValueError("RTC max_guidance_weight must be finite and non-negative")
 
         model_rtc = {
+            "mode": mode,
             "prefix_length": prefix_length,
-            "estimated_delay_steps": min(estimated_delay, prefix_length),
-            "guidance_horizon": min(guidance_horizon, prefix_length),
-            "prefix_schedule": prefix_schedule,
-            "max_guidance_weight": float(max_guidance_weight),
+            "estimated_delay_steps": estimated_delay,
         }
+        if mode == "inference_guidance":
+            guidance_horizon = rtc.get("guidance_horizon")
+            if isinstance(guidance_horizon, bool) or not isinstance(guidance_horizon, int):
+                raise ValueError("RTC guidance_horizon must be an integer")
+            if not estimated_delay <= guidance_horizon <= action_horizon:
+                raise ValueError(
+                    "RTC horizons must satisfy estimated_delay_steps <= "
+                    f"guidance_horizon <= {action_horizon}"
+                )
+            prefix_schedule = rtc.get("prefix_schedule", "exp")
+            if prefix_schedule not in ("zeros", "ones", "linear", "exp"):
+                raise ValueError(f"Unsupported RTC prefix_schedule {prefix_schedule!r}")
+            max_guidance_weight = rtc.get("max_guidance_weight", 10.0)
+            if (
+                isinstance(max_guidance_weight, bool)
+                or not isinstance(max_guidance_weight, (int, float))
+                or not np.isfinite(max_guidance_weight)
+                or max_guidance_weight < 0
+            ):
+                raise ValueError("RTC max_guidance_weight must be finite and non-negative")
+            model_rtc.update(
+                {
+                    "guidance_horizon": min(guidance_horizon, prefix_length),
+                    "prefix_schedule": prefix_schedule,
+                    "max_guidance_weight": float(max_guidance_weight),
+                }
+            )
         model_options = {key: value for key, value in options.items() if key != "rtc"}
         model_options["rtc"] = model_rtc
         return [per_sample_actions], model_options

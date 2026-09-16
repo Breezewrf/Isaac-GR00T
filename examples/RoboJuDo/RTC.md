@@ -597,3 +597,53 @@ rtc_prefix=16, rtc_estimated_delay=6
 - 推理线程发送 leftover prefix，并按实际 tick 跳过新 chunk。
 - PolicyClient/PolicyServer 对包含 NumPy prefix 的 RTC options 往返传输。
 - `double_buffer` 和 `temporal_ensemble` 相关回归行为。
+
+## Training-time RTC
+
+Training-time RTC 需要重新微调 action head。训练时会为每个样本随机选择长度为 `d` 的
+干净动作 prefix，将这些 action token 的 flow timestep 设置为终点，并仅在 postfix 上计算
+flow-matching loss。`d=0` 的样本仍覆盖普通 action chunk 训练。
+
+```bash
+bash examples/finetune.sh \
+  --base-model-path <checkpoint> \
+  --dataset-path <dataset> \
+  --embodiment-tag <tag> \
+  --output-dir <output> \
+  --training-time-rtc \
+  --rtc-max-delay-steps 8 \
+  --rtc-condition-prob 1.0
+```
+
+`--rtc-max-delay-steps` 是包含上界；实际采样还会限制在当前 embodiment 的有效 action
+horizon 之内，并始终保留至少一个 postfix timestep。部署时，向 Policy 传递以下 options：
+
+```bash
+uv run python examples/RoboJuDo/run_robojudo_client.py \
+  --profile x2 \
+  --robot-endpoint tcp://127.0.0.1:8561 \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --command-endpoint tcp://*:8559 \
+  --execution-mode rtc \
+  --rtc-mode training_time \
+  --execution-horizon 8
+```
+
+也可以直接向 Policy 传递以下 options：
+
+```python
+options = {
+    "rtc": {
+        "mode": "training_time",
+        "prefix_actions": prefix_actions,
+        "prefix_length": prefix_length,
+        "estimated_delay_steps": estimated_delay_steps,
+    }
+}
+```
+
+该模式只使用长度为 `estimated_delay_steps` 的 hard prefix，不执行 inference-time RTC 的
+gradient guidance。checkpoint 必须使用 `training_time_rtc=True` 训练，并且部署 delay 不能
+超过训练配置中的 `rtc_max_delay_steps`。未提供 `mode` 时仍默认使用现有
+`inference_guidance` 模式，以兼容旧客户端和 checkpoint。

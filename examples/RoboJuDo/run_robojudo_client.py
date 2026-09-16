@@ -22,6 +22,7 @@ from zmq.utils.monitor import recv_monitor_message
 
 
 EXECUTION_MODES = ("sync", "double_buffer", "temporal_ensemble", "rtc")
+RTC_MODES = ("inference_guidance", "training_time")
 RTC_PREFIX_SCHEDULES = ("zeros", "ones", "linear", "exp")
 
 
@@ -333,6 +334,7 @@ class DoubleBufferedPolicyRunner:
         task_override: str | None,
         execution_mode: str = "double_buffer",
         temporal_ensemble_coeff: float = 0.01,
+        rtc_mode: str = "inference_guidance",
         rtc_prefix_schedule: str = "exp",
         rtc_max_guidance_weight: float = 10.0,
         rtc_latency_window: int = 10,
@@ -349,6 +351,7 @@ class DoubleBufferedPolicyRunner:
         self.task_override = task_override
         self.execution_mode = execution_mode
         self.temporal_ensemble_coeff = temporal_ensemble_coeff
+        self.rtc_mode = rtc_mode
         self.rtc_prefix_schedule = rtc_prefix_schedule
         self.rtc_max_guidance_weight = rtc_max_guidance_weight
         self.rtc_latency_window = rtc_latency_window
@@ -568,17 +571,23 @@ class DoubleBufferedPolicyRunner:
                 if self.execution_mode == "rtc":
                     rtc_options = None
                     if rtc_prefix is not None:
+                        rtc_mode = getattr(self, "rtc_mode", "inference_guidance")
+                        model_rtc = {
+                            "mode": rtc_mode,
+                            "prefix_actions": rtc_prefix,
+                            "prefix_length": prefix_length,
+                            "estimated_delay_steps": estimated_delay_steps,
+                        }
+                        if rtc_mode == "inference_guidance":
+                            model_rtc.update(
+                                {
+                                    "guidance_horizon": min(self.execution_horizon, prefix_length),
+                                    "prefix_schedule": self.rtc_prefix_schedule,
+                                    "max_guidance_weight": self.rtc_max_guidance_weight,
+                                }
+                            )
                         rtc_options = {
-                            "rtc": {
-                                "prefix_actions": rtc_prefix,
-                                "prefix_length": prefix_length,  # L, Remaining prefix length of old action
-                                "estimated_delay_steps": estimated_delay_steps,  # D_est
-                                "guidance_horizon": min(
-                                    self.execution_horizon, prefix_length
-                                ),  # H, execution_horizon is the max guidance horizon for RTC
-                                "prefix_schedule": self.rtc_prefix_schedule,
-                                "max_guidance_weight": self.rtc_max_guidance_weight,
-                            }
+                            "rtc": model_rtc,
                         }
                     policy_chunk = adapter.get_action_chunk(
                         images=observation.images,
@@ -1122,6 +1131,12 @@ def parse_args():
         help="ACT exponential weight coefficient; 0 gives an equal average",
     )
     parser.add_argument(
+        "--rtc-mode",
+        choices=RTC_MODES,
+        default="inference_guidance",
+        help="RTC conditioning method; training_time requires a matching fine-tuned checkpoint",
+    )
+    parser.add_argument(
         "--rtc-prefix-schedule",
         choices=RTC_PREFIX_SCHEDULES,
         default="exp",
@@ -1187,6 +1202,7 @@ def main():
         task_override=args.task,
         execution_mode=args.execution_mode,
         temporal_ensemble_coeff=args.temporal_ensemble_coeff,
+        rtc_mode=args.rtc_mode,
         rtc_prefix_schedule=args.rtc_prefix_schedule,
         rtc_max_guidance_weight=args.rtc_max_guidance_weight,
         rtc_latency_window=args.rtc_latency_window,
