@@ -602,7 +602,9 @@ rtc_prefix=16, rtc_estimated_delay=6
 
 Training-time RTC 需要重新微调 action head。训练时会为每个样本随机选择长度为 `d` 的
 干净动作 prefix，将这些 action token 的 flow timestep 设置为终点，并仅在 postfix 上计算
-flow-matching loss。`d=0` 的样本仍覆盖普通 action chunk 训练。
+flow-matching loss。per-token timestep 会同时用于 action encoder、DiT 每一层的 AdaLayerNorm
+以及 DiT 输出调制；state token 保持当前全局 flow timestep。`d=0` 的样本仍覆盖普通 action
+chunk 训练。
 
 ```bash
 bash examples/finetune.sh \
@@ -612,11 +614,16 @@ bash examples/finetune.sh \
   --output-dir <output> \
   --training-time-rtc \
   --rtc-max-delay-steps 8 \
+  --rtc-target-delay-steps 4 \
+  --rtc-delay-std-steps 1.0 \
   --rtc-condition-prob 1.0
 ```
 
 `--rtc-max-delay-steps` 是包含上界；实际采样还会限制在当前 embodiment 的有效 action
-horizon 之内，并始终保留至少一个 postfix timestep。部署时，向 Policy 传递以下 options：
+horizon 之内，并始终保留至少一个 postfix timestep。设置 `--rtc-target-delay-steps 4` 后，
+训练会从以 4 为峰值、标准差为 1.0 的截断离散高斯分布采样 delay，更贴近稳定在 4 steps
+的部署延迟，同时保留相邻 delay 的鲁棒性。不设置该参数时仍使用均匀采样。部署时，向 Policy
+传递以下 options：
 
 ```bash
 uv run python examples/RoboJuDo/run_robojudo_client.py \

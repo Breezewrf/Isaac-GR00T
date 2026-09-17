@@ -65,10 +65,18 @@ class TimestepEncoder(nn.Module):
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
 
     def forward(self, timesteps):
+        if timesteps.ndim not in (1, 2):
+            raise ValueError(
+                f"Expected timesteps with shape (B,) or (B, T), got {tuple(timesteps.shape)}"
+            )
         dtype = next(self.parameters()).dtype
-        timesteps_proj = self.time_proj(timesteps).to(dtype)
-        timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
-        return timesteps_emb
+        timestep_shape = timesteps.shape
+        # diffusers' Timesteps module accepts only a flat vector. Flattening and
+        # restoring the leading dimensions lets RTC provide one flow timestep per
+        # token without changing the existing batch-level numerical path.
+        timesteps_proj = self.time_proj(timesteps.reshape(-1)).to(dtype)
+        timesteps_emb = self.timestep_embedder(timesteps_proj)
+        return timesteps_emb.reshape(*timestep_shape, -1)
 
 
 class AdaLayerNorm(nn.Module):
@@ -92,8 +100,22 @@ class AdaLayerNorm(nn.Module):
         temb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         temb = self.linear(self.silu(temb))
-        scale, shift = temb.chunk(2, dim=1)
-        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+        scale, shift = temb.chunk(2, dim=-1)
+        if temb.ndim == 2:
+            scale = scale[:, None]
+            shift = shift[:, None]
+        elif temb.ndim == 3:
+            if temb.shape[:2] != x.shape[:2]:
+                raise ValueError(
+                    "Per-token timestep embedding must match hidden-state tokens: "
+                    f"got {tuple(temb.shape[:2])} and {tuple(x.shape[:2])}"
+                )
+        else:
+            raise ValueError(
+                "Expected timestep embedding with shape (B, D) or (B, T, D), "
+                f"got {tuple(temb.shape)}"
+            )
+        x = self.norm(x) * (1 + scale) + shift
         return x
 
 
@@ -289,6 +311,29 @@ class DiT(ModelMixin, ConfigMixin):
             sum(p.numel() for p in self.parameters() if p.requires_grad),
         )
 
+    def _apply_output_projection(
+        self, hidden_states: torch.Tensor, conditioning: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply global or per-token timestep modulation before output projection."""
+        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=-1)
+        if conditioning.ndim == 2:
+            shift = shift[:, None]
+            scale = scale[:, None]
+        elif conditioning.ndim == 3:
+            if conditioning.shape[:2] != hidden_states.shape[:2]:
+                raise ValueError(
+                    "Per-token timestep embedding must match hidden-state tokens: "
+                    f"got {tuple(conditioning.shape[:2])} and "
+                    f"{tuple(hidden_states.shape[:2])}"
+                )
+        else:
+            raise ValueError(
+                "Expected timestep embedding with shape (B, D) or (B, T, D), "
+                f"got {tuple(conditioning.shape)}"
+            )
+        hidden_states = self.norm_out(hidden_states) * (1 + scale) + shift
+        return self.proj_out_2(hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
@@ -327,13 +372,11 @@ class DiT(ModelMixin, ConfigMixin):
             all_hidden_states.append(hidden_states)
 
         # Output processing
-        conditioning = temb
-        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        output = self._apply_output_projection(hidden_states, temb)
         if return_all_hidden_states:
-            return self.proj_out_2(hidden_states), all_hidden_states
+            return output, all_hidden_states
         else:
-            return self.proj_out_2(hidden_states)
+            return output
 
 
 class AlternateVLDiT(DiT):
@@ -405,13 +448,11 @@ class AlternateVLDiT(DiT):
             all_hidden_states.append(hidden_states)
 
         # Output processing
-        conditioning = temb
-        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        output = self._apply_output_projection(hidden_states, temb)
         if return_all_hidden_states:
-            return self.proj_out_2(hidden_states), all_hidden_states
+            return output, all_hidden_states
         else:
-            return self.proj_out_2(hidden_states)
+            return output
 
 
 class SelfAttentionTransformer(ModelMixin, ConfigMixin):

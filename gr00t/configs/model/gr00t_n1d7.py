@@ -114,6 +114,10 @@ class Gr00tN1d7Config(PretrainedConfig):
     # computed on the remaining postfix. ``rtc_max_delay_steps`` is inclusive.
     training_time_rtc: bool = False
     rtc_max_delay_steps: int = 8
+    # When set, sample delays from a truncated discrete Gaussian centered on
+    # this deployment delay. None preserves uniform sampling for compatibility.
+    rtc_target_delay_steps: int | None = None
+    rtc_delay_std_steps: float = 1.5
     rtc_condition_prob: float = 1.0
 
     # Training parameters

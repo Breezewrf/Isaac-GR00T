@@ -15,6 +15,7 @@
 
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
+import math
 import warnings
 
 
@@ -63,6 +64,12 @@ class FinetuneConfig:
 
     rtc_max_delay_steps: int = 8
     """Maximum simulated RTC delay in action steps, inclusive."""
+
+    rtc_target_delay_steps: int | None = None
+    """Center of the truncated discrete-Gaussian delay distribution. None samples uniformly."""
+
+    rtc_delay_std_steps: float = 1.5
+    """Standard deviation, in action steps, when rtc_target_delay_steps is set."""
 
     rtc_condition_prob: float = 1.0
     """Probability that a training sample uses a randomly sampled RTC prefix."""
@@ -209,6 +216,17 @@ class FinetuneConfig:
         if self.rtc_max_delay_steps < 0:
             raise ValueError(
                 f"rtc_max_delay_steps must be non-negative, got {self.rtc_max_delay_steps}"
+            )
+        if self.rtc_target_delay_steps is not None and not (
+            0 <= self.rtc_target_delay_steps <= self.rtc_max_delay_steps
+        ):
+            raise ValueError(
+                "rtc_target_delay_steps must be between 0 and rtc_max_delay_steps, got "
+                f"{self.rtc_target_delay_steps}"
+            )
+        if not math.isfinite(self.rtc_delay_std_steps) or self.rtc_delay_std_steps <= 0:
+            raise ValueError(
+                f"rtc_delay_std_steps must be finite and positive, got {self.rtc_delay_std_steps}"
             )
         if not 0.0 <= self.rtc_condition_prob <= 1.0:
             raise ValueError(f"rtc_condition_prob must be in [0, 1], got {self.rtc_condition_prob}")

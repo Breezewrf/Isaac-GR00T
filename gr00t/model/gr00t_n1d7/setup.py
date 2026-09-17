@@ -91,6 +91,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 load_bf16=self.config.model.load_bf16,
                 training_time_rtc=self.config.model.training_time_rtc,
                 rtc_max_delay_steps=self.config.model.rtc_max_delay_steps,
+                rtc_target_delay_steps=self.config.model.rtc_target_delay_steps,
+                rtc_delay_std_steps=self.config.model.rtc_delay_std_steps,
                 rtc_condition_prob=self.config.model.rtc_condition_prob,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,

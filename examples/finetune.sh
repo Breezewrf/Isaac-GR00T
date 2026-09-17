@@ -28,6 +28,8 @@ SHORTEST_IMAGE_EDGE=""
 CROP_FRACTION=""
 TRAINING_TIME_RTC=0
 RTC_MAX_DELAY_STEPS=8
+RTC_TARGET_DELAY_STEPS=""
+RTC_DELAY_STD_STEPS=1.0
 RTC_CONDITION_PROB=1.0
 EXTRA_ARGS=()
 
@@ -46,6 +48,8 @@ Usage: bash examples/finetune.sh \
   [--crop-fraction <fraction>] \
   [--training-time-rtc] \
   [--rtc-max-delay-steps <steps>] \
+  [--rtc-target-delay-steps <steps>] \
+  [--rtc-delay-std-steps <steps>] \
   [--rtc-condition-prob <probability>] \
   [--ds-weights-alpha <value>] \
   [--save-only-model] \
@@ -110,6 +114,14 @@ while [ "$#" -gt 0 ]; do
             ;;
         --rtc-max-delay-steps)
             RTC_MAX_DELAY_STEPS="$2"
+            shift 2
+            ;;
+        --rtc-target-delay-steps)
+            RTC_TARGET_DELAY_STEPS="$2"
+            shift 2
+            ;;
+        --rtc-delay-std-steps)
+            RTC_DELAY_STD_STEPS="$2"
             shift 2
             ;;
         --rtc-condition-prob)
@@ -223,6 +235,12 @@ if [ "$TRAINING_TIME_RTC" = "1" ]; then
         --rtc-max-delay-steps "$RTC_MAX_DELAY_STEPS"
         --rtc-condition-prob "$RTC_CONDITION_PROB"
     )
+    if [ -n "$RTC_TARGET_DELAY_STEPS" ]; then
+        LAUNCH_CMD+=(
+            --rtc-target-delay-steps "$RTC_TARGET_DELAY_STEPS"
+            --rtc-delay-std-steps "$RTC_DELAY_STD_STEPS"
+        )
+    fi
 fi
 if [ -n "$DS_WEIGHTS_ALPHA" ]; then
     LAUNCH_CMD+=(--ds_weights_alpha "$DS_WEIGHTS_ALPHA")

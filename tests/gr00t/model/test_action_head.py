@@ -159,6 +159,25 @@ class TestActionHeadForward:
         assert torch.all(delays >= 0)
         assert torch.all(delays <= config.action_horizon - 1)
 
+    def test_training_time_rtc_delay_distribution_is_centered_and_truncated(self):
+        config = _small_config(
+            training_time_rtc=True,
+            action_horizon=10,
+            rtc_max_delay_steps=8,
+            rtc_target_delay_steps=4,
+            rtc_delay_std_steps=1.5,
+        )
+        head = Gr00tN1d7ActionHead(config)
+
+        probabilities = head._get_rtc_delay_probabilities(torch.tensor([8, 3, 0]))
+
+        torch.testing.assert_close(probabilities.sum(dim=-1), torch.ones(3))
+        assert probabilities.argmax(dim=-1).tolist() == [4, 3, 0]
+        torch.testing.assert_close(probabilities[0, 3], probabilities[0, 5])
+        torch.testing.assert_close(probabilities[0, 2], probabilities[0, 6])
+        assert torch.count_nonzero(probabilities[1, 4:]) == 0
+        assert torch.count_nonzero(probabilities[2, 1:]) == 0
+
     def test_action_encoder_accepts_per_action_timesteps(self):
         config = _small_config()
         head = Gr00tN1d7ActionHead(config)
@@ -168,6 +187,73 @@ class TestActionHeadForward:
         encoded = head.action_encoder(actions, timesteps, torch.zeros(2, dtype=torch.long))
 
         assert encoded.shape == (2, config.action_horizon, config.input_embedding_dim)
+
+    def test_dit_replicated_per_token_timestep_matches_global_timestep(self):
+        config = _small_config()
+        head = Gr00tN1d7ActionHead(config)
+        head.eval()
+        batch_size = 2
+        token_count = 1 + config.action_horizon
+        hidden_states = torch.randn(batch_size, token_count, config.input_embedding_dim)
+        encoder_hidden_states = torch.randn(batch_size, 3, config.backbone_embedding_dim)
+        global_timestep = torch.tensor([123, 456])
+        per_token_timestep = global_timestep[:, None].expand(-1, token_count)
+
+        with torch.no_grad():
+            global_output = head.model(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=global_timestep,
+            )
+            per_token_output = head.model(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=per_token_timestep,
+            )
+
+        torch.testing.assert_close(per_token_output, global_output)
+
+    @pytest.mark.parametrize("use_alternate_vl_dit", [False, True])
+    def test_training_time_rtc_passes_per_token_timesteps_to_dit(
+        self, monkeypatch, use_alternate_vl_dit
+    ):
+        config = _small_config(
+            training_time_rtc=True,
+            rtc_max_delay_steps=2,
+            use_alternate_vl_dit=use_alternate_vl_dit,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        head.train()
+        captured_timesteps = []
+
+        def capture_timesteps(module, args, kwargs):
+            del module, args
+            captured_timesteps.append(kwargs["timestep"].detach().clone())
+
+        handle = head.model.register_forward_pre_hook(capture_timesteps, with_kwargs=True)
+        monkeypatch.setattr(
+            head,
+            "_sample_rtc_delays",
+            lambda action_mask: torch.tensor([2, 1], device=action_mask.device),
+        )
+        backbone_output = _make_backbone_output(config)
+        if use_alternate_vl_dit:
+            backbone_output["backbone_attention_mask"] = backbone_output[
+                "backbone_attention_mask"
+            ].bool()
+        try:
+            output = head.forward(backbone_output, _make_action_input(config))
+            output["loss"].backward()
+        finally:
+            handle.remove()
+
+        assert len(captured_timesteps) == 1
+        timesteps = captured_timesteps[0]
+        assert timesteps.shape == (2, 1 + config.action_horizon)
+        assert torch.all(timesteps[0, 1:3] == config.num_timestep_buckets)
+        assert torch.all(timesteps[1, 1:2] == config.num_timestep_buckets)
+        torch.testing.assert_close(timesteps[0, 0], timesteps[0, 3])
+        torch.testing.assert_close(timesteps[1, 0], timesteps[1, 2])
 
 
 class TestActionHeadGetAction:
@@ -243,25 +329,40 @@ class TestActionHeadGetAction:
         head.eval()
         action_input = _make_action_input(config, batch_size=1)
         expected_prefix = action_input["action"][:, :2].clone()
+        captured_timesteps = []
+
+        def capture_timesteps(module, args, kwargs):
+            del module, args
+            captured_timesteps.append(kwargs["timestep"].detach().clone())
+
+        handle = head.model.register_forward_pre_hook(capture_timesteps, with_kwargs=True)
 
         def fail_if_called(*args, **kwargs):
             raise AssertionError("training-time RTC must not call torch.autograd.grad")
 
         monkeypatch.setattr(torch.autograd, "grad", fail_if_called)
-        out = head.get_action(
-            _make_backbone_output(config, batch_size=1),
-            action_input,
-            options={
-                "rtc": {
-                    "mode": "training_time",
-                    "prefix_length": config.action_horizon,
-                    "estimated_delay_steps": 2,
-                }
-            },
-        )
+        try:
+            out = head.get_action(
+                _make_backbone_output(config, batch_size=1),
+                action_input,
+                options={
+                    "rtc": {
+                        "mode": "training_time",
+                        "prefix_length": config.action_horizon,
+                        "estimated_delay_steps": 2,
+                    }
+                },
+            )
+        finally:
+            handle.remove()
 
         torch.testing.assert_close(out["action_pred"][:, :2], expected_prefix)
         assert not out["action_pred"].requires_grad
+        assert len(captured_timesteps) == config.num_inference_timesteps
+        for timesteps in captured_timesteps:
+            assert timesteps.shape == (1, 1 + config.action_horizon)
+            assert torch.all(timesteps[:, 1:3] == config.num_timestep_buckets)
+            torch.testing.assert_close(timesteps[:, 0], timesteps[:, 3])
 
     def test_training_time_rtc_rejects_untrained_checkpoint(self, action_head):
         head, config = action_head

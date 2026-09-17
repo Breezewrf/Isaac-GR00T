@@ -183,6 +183,12 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.num_timestep_buckets = config.num_timestep_buckets
         if config.rtc_max_delay_steps < 0:
             raise ValueError("rtc_max_delay_steps must be non-negative")
+        if config.rtc_target_delay_steps is not None and not (
+            0 <= config.rtc_target_delay_steps <= config.rtc_max_delay_steps
+        ):
+            raise ValueError("rtc_target_delay_steps must be between 0 and rtc_max_delay_steps")
+        if not math.isfinite(config.rtc_delay_std_steps) or config.rtc_delay_std_steps <= 0:
+            raise ValueError("rtc_delay_std_steps must be finite and positive")
         if not 0.0 <= config.rtc_condition_prob <= 1.0:
             raise ValueError("rtc_condition_prob must be in [0, 1]")
         self.set_trainable_parameters(
@@ -243,8 +249,30 @@ class Gr00tN1d7ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
+    def _get_rtc_delay_probabilities(self, max_delays: torch.Tensor) -> torch.Tensor:
+        """Return truncated discrete-Gaussian delay probabilities for each sample."""
+        if self.config.rtc_target_delay_steps is None:
+            raise ValueError("rtc_target_delay_steps is required for centered delay sampling")
+
+        delay_candidates = torch.arange(
+            self.config.rtc_max_delay_steps + 1,
+            device=max_delays.device,
+            dtype=torch.float32,
+        )
+        centered = (delay_candidates - self.config.rtc_target_delay_steps) / float(
+            self.config.rtc_delay_std_steps
+        )
+        logits = (-0.5 * centered.square()).expand(max_delays.shape[0], -1).clone()
+        logits.masked_fill_(delay_candidates[None, :] > max_delays[:, None], -torch.inf)
+        return logits.softmax(dim=-1)
+
     def _sample_rtc_delays(self, action_mask: torch.Tensor) -> torch.Tensor:
-        """Sample an inclusive RTC delay for every item in the batch."""
+        """Sample an inclusive RTC delay for every item in the batch.
+
+        By default the distribution is uniform for backward compatibility. If
+        ``rtc_target_delay_steps`` is configured, use a truncated discrete
+        Gaussian centered on the typical deployment delay instead.
+        """
         valid_steps = action_mask.bool().any(dim=-1).sum(dim=-1)
         if torch.any(valid_steps < 1):
             raise ValueError("Training-time RTC requires at least one valid action timestep")
@@ -252,9 +280,13 @@ class Gr00tN1d7ActionHead(nn.Module):
         configured_max = torch.full_like(valid_steps, self.config.rtc_max_delay_steps)
         # Always retain at least one valid postfix action to supervise.
         max_delays = torch.minimum(configured_max, valid_steps - 1).clamp_min(0)
-        delays = torch.floor(
-            torch.rand(valid_steps.shape, device=action_mask.device) * (max_delays + 1)
-        ).long()
+        if self.config.rtc_target_delay_steps is None:
+            delays = torch.floor(
+                torch.rand(valid_steps.shape, device=action_mask.device) * (max_delays + 1)
+            ).long()
+        else:
+            probabilities = self._get_rtc_delay_probabilities(max_delays)
+            delays = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
 
         if self.config.rtc_condition_prob < 1.0:
             use_conditioning = (
@@ -326,6 +358,34 @@ class Gr00tN1d7ActionHead(nn.Module):
             "rtc_delays": rtc_delays,
         }
 
+    @staticmethod
+    def _build_dit_timesteps(
+        global_timestep: torch.Tensor,
+        action_timesteps: torch.Tensor,
+        state_token_count: int,
+    ) -> torch.Tensor:
+        """Build DiT conditioning with one timestep per state/action token for RTC."""
+        if action_timesteps.ndim == 1:
+            return global_timestep
+        if action_timesteps.ndim != 2:
+            raise ValueError(
+                "Expected action_timesteps with shape (B,) or (B, T), "
+                f"got {tuple(action_timesteps.shape)}"
+            )
+        if global_timestep.ndim != 1 or global_timestep.shape[0] != action_timesteps.shape[0]:
+            raise ValueError(
+                "global_timestep batch must match action_timesteps: "
+                f"got {tuple(global_timestep.shape)} and {tuple(action_timesteps.shape)}"
+            )
+        if state_token_count < 0:
+            raise ValueError("state_token_count must be non-negative")
+
+        # State observations are not diffused, but GR00T's existing state token is
+        # globally flow-conditioned. Keep that behavior and only give clean RTC
+        # action-prefix tokens the terminal flow timestep.
+        state_timesteps = global_timestep[:, None].expand(-1, state_token_count)
+        return torch.cat((state_timesteps, action_timesteps), dim=1)
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
@@ -396,6 +456,11 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Join vision, language, state and action embedding along sequence dimension.
         sa_embs = torch.cat((state_features, action_features), dim=1)
+        dit_timesteps = self._build_dit_timesteps(
+            flow_inputs["global_timestep"],
+            flow_inputs["action_timesteps"],
+            state_features.shape[1],
+        )
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         if self.config.use_alternate_vl_dit:
@@ -405,7 +470,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
-                timestep=flow_inputs["global_timestep"],
+                timestep=dit_timesteps,
                 return_all_hidden_states=True,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
@@ -415,7 +480,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
-                timestep=flow_inputs["global_timestep"],
+                timestep=dit_timesteps,
                 return_all_hidden_states=True,
             )
 
@@ -611,11 +676,14 @@ class Gr00tN1d7ActionHead(nn.Module):
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 action_features = action_features + self.position_embedding(pos_ids).unsqueeze(0)
             sa_embs = torch.cat((state_features, action_features), dim=1)
+            model_timesteps = self._build_dit_timesteps(
+                dit_timestep, action_timesteps, state_features.shape[1]
+            )
             if self.config.use_alternate_vl_dit:
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
-                    timestep=dit_timestep,
+                    timestep=model_timesteps,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
                 )
@@ -623,7 +691,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
-                    timestep=dit_timestep,
+                    timestep=model_timesteps,
                 )
             pred = self.action_decoder(model_output, embodiment_id)
             return pred[:, -self.action_horizon :]
