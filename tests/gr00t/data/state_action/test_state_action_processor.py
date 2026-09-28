@@ -24,6 +24,7 @@ import json
 from pathlib import Path
 
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
+from gr00t.data.utils import normalize_values_minmax
 import numpy as np
 import pytest
 
@@ -168,6 +169,40 @@ class TestActionNormalization:
         for key in action_keys:
             np.testing.assert_allclose(
                 recovered[key], raw[key], atol=1e-4, err_msg=f"Action roundtrip failed for {key}"
+            )
+
+    def test_per_timestep_minmax_statistics_broadcast_over_batch(self):
+        values = np.array(
+            [
+                [[0.5, 7.0], [3.0, 4.0], [9.0, 2.0]],
+                [[1.0, -3.0], [2.0, 5.0], [8.0, 6.0]],
+            ],
+            dtype=np.float32,
+        )
+        params = {
+            "min": np.array([[0.0, 7.0], [1.0, 2.0], [9.0, 0.0]]),
+            "max": np.array([[1.0, 7.0], [3.0, 6.0], [9.0, 4.0]]),
+        }
+
+        normalized = normalize_values_minmax(values, params)
+
+        expected = np.array(
+            [
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 0.0]],
+                [[1.0, 0.0], [0.0, 0.5], [0.0, 2.0]],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(normalized, expected)
+
+    def test_minmax_normalization_rejects_statistics_that_expand_input(self):
+        with pytest.raises(ValueError, match="would expand the input"):
+            normalize_values_minmax(
+                np.zeros((40, 5), dtype=np.float32),
+                {
+                    "min": np.zeros((1, 40, 5), dtype=np.float32),
+                    "max": np.ones((1, 40, 5), dtype=np.float32),
+                },
             )
 
 

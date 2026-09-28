@@ -723,6 +723,22 @@ class DoubleBufferedPolicyRunner:
                 self._command_subscriber_connected = False
                 print(f"[command] subscriber disconnected: {endpoint}", flush=True)
 
+    def _reserve_rtc_command_locked(
+        self, active_session: tuple[str, int]
+    ) -> tuple[dict | None, int, bool]:
+        """Reserve one RTC command and advance its timeline atomically.
+
+        The inference thread snapshots ``_control_tick`` and the RTC queue cursor
+        under the same condition lock. Advancing only one of them would make the
+        prefix start one step later than the tick used to measure inference delay.
+        """
+        current_tick = self._control_tick
+        command = self._rtc_queue.pop()
+        tick_advanced = self._control_tick_session == active_session
+        if tick_advanced:
+            self._control_tick += 1
+        return command, current_tick, tick_advanced
+
     def run(self):
         print("Waiting for the first RoboJuDo observation and GR00T action chunk...", flush=True)
         self._observation_thread.start()
@@ -754,6 +770,7 @@ class DoubleBufferedPolicyRunner:
             rtc_command = None
             current_tick = 0
             sync_chunk_finished = False
+            control_tick_advanced = False
             with self._condition:
                 if self._error is not None:
                     raise RuntimeError("RoboJuDo deployment worker failed") from self._error
@@ -928,8 +945,9 @@ class DoubleBufferedPolicyRunner:
                             )
                     current_tick = self._control_tick
                 if self.execution_mode == "rtc" and control_enabled:
-                    rtc_command = self._rtc_queue.pop()
-                    current_tick = self._control_tick
+                    rtc_command, current_tick, control_tick_advanced = (
+                        self._reserve_rtc_command_locked(active_session)
+                    )
                 observation_was_fresh = observation_fresh
                 control_was_enabled = control_enabled
             if self.execution_mode == "temporal_ensemble":
@@ -1018,7 +1036,7 @@ class DoubleBufferedPolicyRunner:
                 report_commands += 1
             if control_enabled and active_session is not None:
                 with self._condition:
-                    if self._control_tick_session == active_session:
+                    if not control_tick_advanced and self._control_tick_session == active_session:
                         self._control_tick += 1
                     if sync_chunk_finished:
                         # Wake inference only after the final command in the

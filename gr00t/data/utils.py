@@ -99,16 +99,38 @@ def normalize_values_minmax(values, params):
         # 2D bounds - per-step normalization
         values: (8, 4), params["min"]: (8, 4), params["max"]: (8, 4)
     """
-    min_vals = params["min"]
-    max_vals = params["max"]
+    values = np.asarray(values)
+    min_vals = np.asarray(params["min"])
+    max_vals = np.asarray(params["max"])
+
+    try:
+        broadcast_shape = np.broadcast_shapes(values.shape, min_vals.shape, max_vals.shape)
+    except ValueError as exc:
+        raise ValueError(
+            "Min-max normalization shapes are not broadcast-compatible: "
+            f"values={values.shape}, min={min_vals.shape}, max={max_vals.shape}"
+        ) from exc
+    if broadcast_shape != values.shape:
+        raise ValueError(
+            "Min-max statistics would expand the input instead of normalizing it in place: "
+            f"values={values.shape}, min={min_vals.shape}, max={max_vals.shape}, "
+            f"broadcast={broadcast_shape}"
+        )
+
+    range_vals = max_vals - min_vals
+    valid_range = ~np.isclose(range_vals, 0)
     normalized = np.zeros_like(values)
-
-    mask = ~np.isclose(max_vals, min_vals)
-
-    normalized[..., mask] = (values[..., mask] - min_vals[..., mask]) / (
-        max_vals[..., mask] - min_vals[..., mask]
+    np.divide(
+        values - min_vals,
+        range_vals,
+        out=normalized,
+        where=valid_range,
     )
-    normalized[..., mask] = 2 * normalized[..., mask] - 1
+    # Constant dimensions remain zero. Avoid multidimensional boolean advanced
+    # indexing here: per-timestep statistics have shape (T, D), and flattening
+    # that mask is fragile for batched (B, T, D) inputs.
+    normalized *= 2
+    normalized -= valid_range.astype(normalized.dtype, copy=False)
 
     return normalized
 

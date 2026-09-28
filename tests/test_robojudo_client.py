@@ -229,6 +229,29 @@ def test_rtc_queue_rejects_cross_task_prefix_and_expires_old_chunk():
     assert queue.pop() is None
 
 
+def test_rtc_command_reservation_advances_queue_and_control_tick_together():
+    runner = client_module.DoubleBufferedPolicyRunner.__new__(
+        client_module.DoubleBufferedPolicyRunner
+    )
+    runner._condition = threading.Condition()
+    runner._rtc_queue = client_module.RTCActionQueue()
+    runner._rtc_queue.replace(_rtc_chunk(values=[10.0, 11.0, 12.0]), skipped_steps=0)
+    runner._control_tick = 7
+    runner._control_tick_session = ("test-stream", 1)
+
+    with runner._condition:
+        command, current_tick, tick_advanced = runner._reserve_rtc_command_locked(
+            ("test-stream", 1)
+        )
+        prefix = runner._rtc_queue.get_left_over(("test-stream", 1), "test task")
+
+        assert command["positions"]["joint"] == 10.0
+        assert current_tick == 7
+        assert tick_advanced
+        assert runner._control_tick == 8
+        np.testing.assert_allclose(prefix["joint"], [[[11.0], [12.0]]])
+
+
 def test_parse_args_accepts_horizon_above_previous_fixed_limit():
     argv = [
         "run_robojudo_client.py",

@@ -20,6 +20,8 @@ def test_checkpoint_loading_overrides_rtc_config(tmp_path, monkeypatch):
     config.training.start_from_checkpoint = "base-checkpoint"
     config.model.training_time_rtc = True
     config.model.rtc_max_delay_steps = 6
+    config.model.rtc_target_delay_steps = 4
+    config.model.rtc_delay_std_steps = 1.25
     config.model.rtc_condition_prob = 0.25
 
     fake_model = _FakeModel(config.model)
@@ -32,4 +34,6 @@ def test_checkpoint_loading_overrides_rtc_config(tmp_path, monkeypatch):
     loading_kwargs = from_pretrained.call_args.kwargs
     assert loading_kwargs["training_time_rtc"] is True
     assert loading_kwargs["rtc_max_delay_steps"] == 6
+    assert loading_kwargs["rtc_target_delay_steps"] == 4
+    assert loading_kwargs["rtc_delay_std_steps"] == 1.25
     assert loading_kwargs["rtc_condition_prob"] == 0.25
