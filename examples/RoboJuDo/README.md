@@ -75,6 +75,73 @@ CUDA_VISIBLE_DEVICES=0 NUM_GPUS=1 uv run bash examples/finetune.sh \
   --output-dir /tmp/robojudo_g1_23dof_finetune
 ```
 
+## Offline DAgger training for G1
+
+After converting the label-aware recorder dataset to LeRobot v2.1, install the same three-camera
+modality mapping used by the original G1 SFT run:
+
+```bash
+cp examples/RoboJuDo/g1_23dof_mulcam_modality.json \
+  /home/breeze/Desktop/workplace/Humanoid/RoboJuDo-Plus/record_data/g1_23dof_upper_body_pickup_mulcam_dagger/meta/modality.json
+```
+
+Start from the matching G1 SFT checkpoint. `--dagger-expert-only` reads `expert_applied` and
+`action_source` from each v2.1 Parquet episode and samples only starts whose full 16-action window
+was executed by the expert. It retains the checkpoint processor's state, action, and relative-action
+normalization statistics. The original demonstration dataset is not sampled in this run.
+
+```bash
+USE_WANDB=0 MAX_STEPS=200 SAVE_STEPS=50 \
+CUDA_VISIBLE_DEVICES=0 NUM_GPUS=1 uv run bash examples/finetune.sh \
+  --base-model-path checkpoints/g1_23dof_upper_body_pickup_mulcam \
+  --dataset-path /home/breeze/Desktop/workplace/Humanoid/RoboJuDo-Plus/record_data/g1_23dof_upper_body_pickup_mulcam_dagger \
+  --modality-config-path examples/RoboJuDo/robojudo_g1_23dof_mulcam_config.py \
+  --embodiment-tag NEW_EMBODIMENT \
+  --learning-rate 1e-5 \
+  --dagger-expert-only \
+  --output-dir /tmp/robojudo_g1_dagger_finetune
+```
+
+The current two-episode dataset contains 868 expert-valid 16-action starts. Training fails early if
+none remain or the checkpoint lacks G1 normalization statistics. The flag requires one dataset path;
+training without the flag keeps the standard GR00T data path. The example explicitly uses a `1e-5`
+learning rate, 200 optimizer steps, and checkpoints every 50 steps for this small dataset. These
+values are a starting point, not DAgger defaults; omit them to keep the standard GR00T settings.
+Set `MAX_STEPS=10` for a short smoke run.
+The standard projector and diffusion-model tuning configuration exceeded 16 GB GPU memory during
+a local one-step backward pass; use a larger GPU for that configuration.
+
+### How this compares with RLInf and LeRobot
+
+| | This GR00T offline DAgger run | RLInf real-world HG-DAgger | LeRobot HIL / DAgger |
+| --- | --- | --- | --- |
+| Collection and updates | Collect with a fixed policy, then fine-tune on a fixed dataset | Collect and update the policy online using a rolling window of recent data | Collect interventions, then fine-tune offline; repeat in later rounds |
+| Saved data | Keep the whole rollout, including policy and expert segments, with per-frame `expert_applied` and `action_source` | Archive the whole successful episode, including policy and expert segments, with intervention labels | Current `record_autonomous=False` default saves correction windows as separate episodes; optional continuous mode also saves autonomous segments and intervention labels |
+| Training samples | Require all 16 actions in a chunk to be expert-applied; reject padding | With `only_save_expert=True`, require every non-padded action in a chunk to be a human intervention | The HIL tutorial uses ordinary policy fine-tuning; it does not specify an expert-only action-chunk sampler |
+| Original demonstrations | Initialize from the task SFT checkpoint; do not mix the old demonstration dataset into this run | Initialize from SFT; the real-world online sampler trains on its intervention data window | The HIL tutorial recommends fine-tuning on merged original demonstrations and HIL data |
+| Normalization | Reuse state, action, and relative-action statistics from the matching G1 SFT checkpoint | Prepare and use the task's OpenPI normalization statistics | The HIL tutorial does not prescribe a common normalization strategy |
+| Evaluation | No automatic evaluation in this offline training path; compare checkpoints in a separate policy-only rollout | The example config sets evaluation to policy-only (`teleop: none`), but disables periodic validation | The tutorial deploys each fine-tuned checkpoint before the next collection round |
+
+Because failed cases are discarded during this project's collection, its saved whole rollouts and
+RLInf's saved whole *successful* episodes have essentially the same scope. In both cases, retaining
+policy segments for context does not mean training on their actions. The main differences from RLInf
+are offline versus online updates and fixed versus rolling data. RLInf follows LeRobot's episode-end
+clamping and marks out-of-range actions as padding; its expert filter checks only real frames. This
+GR00T loader has no action padding mask in its training samples, so it excludes incomplete 16-action
+windows instead. Both current episodes end with at least 15 policy frames, so allowing RLInf-style
+padding would add zero expert-valid starts here: the count remains 868.
+
+The model and loss implementations also differ: this run uses GR00T's normal supervised training
+path, while RLInf uses its OpenPI `embodied_dagger` loss. The example learning rate and step count
+above are tuning choices, not what defines DAgger.
+
+Sources: [RLInf real-world HG-DAgger guide](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/hg-dagger.html),
+[RLInf real-world configuration](https://github.com/RLinf/RLinf/blob/main/examples/embodiment/config/realworld_pnp_dagger_openpi.yaml),
+[LeRobot HIL guide](https://huggingface.co/docs/lerobot/hil_data_collection), and
+[LeRobot DAgger recording configuration](https://github.com/huggingface/lerobot/blob/main/src/lerobot/rollout/configs.py).
+The LeRobot guide describes a combined-data workflow; its current recording configuration also
+supports a corrections-only default, so these are distinct choices rather than a single recipe.
+
 ## Prepare X2 data
 
 Convert the X2 recorder output:

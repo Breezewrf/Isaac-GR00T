@@ -57,6 +57,8 @@ if __name__ == "__main__":
         load_modality_config(ft_config.modality_config_path)
 
     dataset_paths = [path for path in ft_config.dataset_path.split(os.pathsep) if path]
+    if ft_config.dagger_expert_only and len(dataset_paths) != 1:
+        raise ValueError("--dagger-expert-only requires exactly one DAgger dataset path")
 
     config = get_default_config().load_dict(
         {
@@ -122,6 +124,9 @@ if __name__ == "__main__":
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
     config.data.ds_weights_alpha = ft_config.ds_weights_alpha
+    config.data.dagger_expert_only = ft_config.dagger_expert_only
+    if ft_config.dagger_expert_only:
+        config.data.override_pretraining_statistics = False
 
     config.training.save_only_model = ft_config.save_only_model
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint

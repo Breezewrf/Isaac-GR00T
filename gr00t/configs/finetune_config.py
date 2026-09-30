@@ -173,6 +173,9 @@ class FinetuneConfig:
     """Power-law exponent for dataset soup weighting. When set, each dataset's
     sampling weight is len(dataset)^alpha and per-dataset mix_ratio values are ignored."""
 
+    dagger_expert_only: bool = False
+    """Use only fully expert-applied action chunks and keep checkpoint normalization statistics."""
+
     shard_size: int = 2**10
     """Size of the shard to use for the dataset during preloading."""
 

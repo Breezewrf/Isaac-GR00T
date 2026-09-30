@@ -224,6 +224,7 @@ class ShardedMixtureDataset(IterableDataset):
         training: bool = True,
         num_shards_per_epoch: int = int(1e5),
         override_pretraining_statistics: bool = False,
+        reuse_pretraining_statistics: bool = False,
     ):
         """Initialize mixture dataset with datasets, weights, and configuration."""
         self.datasets = datasets
@@ -234,6 +235,7 @@ class ShardedMixtureDataset(IterableDataset):
         self.epoch = 0
         self.processor = processor
         self.override_pretraining_statistics = override_pretraining_statistics
+        self.reuse_pretraining_statistics = reuse_pretraining_statistics
 
         # Generate initial shard sampling schedule
         self.shard_sampling_schedule = self.generate_shard_sampling_schedule()
@@ -266,6 +268,32 @@ class ShardedMixtureDataset(IterableDataset):
         weighted averaging, then configures the processor with merged statistics.
         This ensures consistent normalization across datasets within each embodiment.
         """
+        if self.reuse_pretraining_statistics:
+            state_action_processor = getattr(self.processor, "state_action_processor", None)
+            checkpoint_stats = getattr(state_action_processor, "statistics", {})
+            embeddings = {ds.embodiment_tag.value for ds in self.datasets}
+            for embodiment in embeddings:
+                stats = checkpoint_stats.get(embodiment, {})
+                required = {"state", "action"}
+                if not required.issubset(stats):
+                    raise ValueError(
+                        f"Checkpoint processor has no complete statistics for {embodiment}; "
+                        "DAgger training requires a task-specific SFT checkpoint"
+                    )
+                if (
+                    getattr(self.processor, "use_relative_action", False)
+                    and "relative_action" not in stats
+                ):
+                    raise ValueError(
+                        f"Checkpoint processor has no relative action statistics for {embodiment}"
+                    )
+            self.global_stats = {
+                embodiment: checkpoint_stats[embodiment] for embodiment in embeddings
+            }
+            for ds in self.datasets:
+                ds.set_processor(self.processor)
+            return
+
         # Group datasets and weights by embodiment
         all_stats_by_emb: dict[str, list] = {}
         weights_by_emb: dict[str, list[float]] = {}

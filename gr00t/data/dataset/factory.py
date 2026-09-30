@@ -43,6 +43,12 @@ class DatasetFactory:
 
         all_datasets = []
         all_weights = []
+        dagger_expert_only = self.config.data.dagger_expert_only
+        if (
+            dagger_expert_only
+            and sum(len(spec.dataset_paths) for spec in self.config.data.datasets) != 1
+        ):
+            raise ValueError("DAgger expert-only training requires exactly one dataset")
         for dataset_spec in tqdm(
             self.config.data.datasets,
             total=len(self.config.data.datasets),
@@ -54,10 +60,11 @@ class DatasetFactory:
                 assert embodiment_tag is not None, "Embodiment tag is required"
                 assert self.config.data.mode == "single_turn", "Only single turn mode is supported"
                 # rank-0 writes stats; helper barriers before peers read them.
-                with run_or_wait_on_rank0(label=f"generate_stats({dataset_path})") as is_rank0:
-                    if is_rank0:
-                        generate_stats(dataset_path)
-                        generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
+                if not dagger_expert_only:
+                    with run_or_wait_on_rank0(label=f"generate_stats({dataset_path})") as is_rank0:
+                        if is_rank0:
+                            generate_stats(dataset_path)
+                            generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
                 dataset = ShardedSingleStepDataset(
                     dataset_path=dataset_path,
                     embodiment_tag=EmbodimentTag(embodiment_tag),
@@ -66,6 +73,7 @@ class DatasetFactory:
                     episode_sampling_rate=self.config.data.episode_sampling_rate,
                     seed=self.config.data.seed,
                     allow_padding=self.config.data.allow_padding,
+                    dagger_expert_only=dagger_expert_only,
                 )
                 datasets.append(dataset)
             dataset_lengths = np.array([len(dataset) for dataset in datasets])
@@ -93,6 +101,7 @@ class DatasetFactory:
                 training=True,
                 num_shards_per_epoch=self.config.data.num_shards_per_epoch,
                 override_pretraining_statistics=self.config.data.override_pretraining_statistics,
+                reuse_pretraining_statistics=dagger_expert_only,
             ),
             None,
         )

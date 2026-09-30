@@ -84,6 +84,38 @@ class MockShardedDataset(ShardedDataset):
         return self._statistics
 
 
+def test_dagger_reuses_checkpoint_statistics():
+    dataset = MockShardedDataset("/fake/dagger", embodiment_tag="new_embodiment")
+    processor = MagicMock()
+    processor.state_action_processor.statistics = {
+        "new_embodiment": {
+            "state": {"arm": {}},
+            "action": {"arm": {}},
+            "relative_action": {"arm": {}},
+        }
+    }
+    processor.use_relative_action = True
+
+    mixture = ShardedMixtureDataset(
+        [dataset],
+        [1.0],
+        processor,
+        reuse_pretraining_statistics=True,
+    )
+
+    assert mixture.get_dataset_statistics() == processor.state_action_processor.statistics
+    processor.set_statistics.assert_not_called()
+
+
+def test_dagger_requires_checkpoint_statistics():
+    dataset = MockShardedDataset("/fake/dagger", embodiment_tag="new_embodiment")
+    processor = MagicMock()
+    processor.state_action_processor.statistics = {}
+
+    with pytest.raises(ValueError, match="task-specific SFT checkpoint"):
+        ShardedMixtureDataset([dataset], [1.0], processor, reuse_pretraining_statistics=True)
+
+
 # ---------------------------------------------------------------------------
 # merge_statistics tests
 # ---------------------------------------------------------------------------

@@ -108,6 +108,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_sampling_rate: Fraction of episode timesteps to use (for efficiency)
         seed: Random seed for reproducible sharding and sampling
         allow_padding: Whether to allow padding of indices to valid range [0, max_length - 1]
+        dagger_expert_only: Whether to sample only fully expert-applied action windows
 
     Example:
         >>> dataset = ShardedSingleStepDataset(
@@ -135,6 +136,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_sampling_rate: float = 0.1,
         seed: int = 42,
         allow_padding: bool = False,
+        dagger_expert_only: bool = False,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -144,10 +146,16 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.episode_sampling_rate = episode_sampling_rate
         self.seed = seed
         self.allow_padding = allow_padding
+        self.dagger_expert_only = dagger_expert_only
         self.processor = None
         self.rng = np.random.default_rng(seed)
         action_delta_indices = modality_configs["action"].delta_indices
+        self.action_delta_indices = tuple(action_delta_indices)
         self.action_horizon = max(action_delta_indices) - min(action_delta_indices) + 1
+        if dagger_expert_only and (allow_padding or min(action_delta_indices) != 0):
+            raise ValueError(
+                "DAgger expert-only sampling requires unpadded action indices starting at zero"
+            )
 
         self.episode_loader = LeRobotEpisodeLoader(
             dataset_path=dataset_path,
@@ -184,7 +192,11 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_splits = []
         total_steps = 0
         for ep_idx in shuffled_episode_indices:
-            step_indices = np.arange(0, self.get_effective_episode_length(ep_idx))
+            step_indices = (
+                self.get_expert_step_indices(ep_idx)
+                if self.dagger_expert_only
+                else np.arange(0, self.get_effective_episode_length(ep_idx))
+            )
             self.rng.shuffle(step_indices)
             total_steps += len(step_indices)
             for i in range(num_splits):
@@ -193,9 +205,11 @@ class ShardedSingleStepDataset(ShardedDataset):
                     episode_splits.append((ep_idx, split_step_indices))
 
         assert total_steps > 0 and len(episode_splits) > 0, (
-            f"No valid timesteps found for dataset {self.dataset_path}; "
-            f"episode lengths may be shorter than action horizon {self.action_horizon}"
+            f"No valid {'expert action chunks' if self.dagger_expert_only else 'timesteps'} "
+            f"found for dataset {self.dataset_path}; action horizon {self.action_horizon}"
         )
+        if self.dagger_expert_only:
+            print(f"DAgger expert-only logical chunk starts: {total_steps}")
 
         # Calculate num_shards: bounded by total_steps/shard_size and episode_splits count
         # Never more shards than episode_splits to ensure all shards are non-empty
@@ -234,6 +248,41 @@ class ShardedSingleStepDataset(ShardedDataset):
         """Get the effective episode length accounting for action horizon."""
         original_length = self.episode_loader.get_episode_length(episode_index)
         return max(0, original_length - self.action_horizon + 1)
+
+    def get_expert_step_indices(self, episode_index: int) -> np.ndarray:
+        """Select starts whose entire unpadded action window was executed by the expert."""
+        episode_meta = self.episode_loader.episodes_metadata[episode_index]
+        episode_id = int(episode_meta["episode_index"])
+        parquet_path = Path(self.dataset_path) / self.episode_loader.data_path_pattern.format(
+            episode_chunk=episode_id // self.episode_loader.chunk_size,
+            episode_index=episode_id,
+        )
+        try:
+            labels = pd.read_parquet(parquet_path, columns=["expert_applied", "action_source"])
+        except Exception as exc:
+            raise ValueError(f"Could not read DAgger labels from {parquet_path}") from exc
+        episode_length = self.episode_loader.get_episode_length(episode_index)
+        if len(labels) != episode_length:
+            raise ValueError(
+                f"DAgger label count {len(labels)} differs from episode length {episode_length}: {parquet_path}"
+            )
+        applied = labels["expert_applied"]
+        source = labels["action_source"]
+        valid_booleans = applied.map(lambda value: isinstance(value, (bool, np.bool_))).all()
+        if applied.isna().any() or source.isna().any() or not valid_booleans:
+            raise ValueError(f"DAgger labels contain invalid values: {parquet_path}")
+        if (
+            not source.isin(["policy", "expert"]).all()
+            or not (applied == (source == "expert")).all()
+        ):
+            raise ValueError(f"DAgger action_source and expert_applied disagree: {parquet_path}")
+        valid_count = self.get_effective_episode_length(episode_index)
+        starts = np.arange(valid_count)
+        valid = np.ones(valid_count, dtype=bool)
+        expert = applied.to_numpy(dtype=bool)
+        for delta in self.action_delta_indices:
+            valid &= expert[starts + delta]
+        return starts[valid]
 
     def __len__(self):
         """Return the number of shards in the dataset."""

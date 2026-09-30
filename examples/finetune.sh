@@ -6,6 +6,7 @@ NUM_GPUS="${NUM_GPUS:-1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 SAVE_STEPS="${SAVE_STEPS:-1000}"
 MAX_STEPS="${MAX_STEPS:-10000}"
+LEARNING_RATE="1e-4"
 USE_WANDB="${USE_WANDB:-1}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
@@ -13,6 +14,7 @@ SHARD_SIZE="${SHARD_SIZE:-1024}"
 NUM_SHARDS_PER_EPOCH="${NUM_SHARDS_PER_EPOCH:-100000}"
 EPISODE_SAMPLING_RATE="${EPISODE_SAMPLING_RATE:-0.1}"
 DS_WEIGHTS_ALPHA="${DS_WEIGHTS_ALPHA:-}"
+DAGGER_EXPERT_ONLY=0
 
 BASE_MODEL_PATH=""
 DATASET_PATH=""
@@ -42,6 +44,8 @@ Usage: bash examples/finetune.sh \
   [--shortest-image-edge <pixels>] \
   [--crop-fraction <fraction>] \
   [--ds-weights-alpha <value>] \
+  [--learning-rate <value>] \
+  [--dagger-expert-only] \
   [--save-only-model] \
   [--resume-from-checkpoint] \
   [-- <extra launch_finetune.py args>...]
@@ -102,6 +106,14 @@ while [ "$#" -gt 0 ]; do
             DS_WEIGHTS_ALPHA="$2"
             shift 2
             ;;
+        --learning-rate)
+            LEARNING_RATE="$2"
+            shift 2
+            ;;
+        --dagger-expert-only)
+            DAGGER_EXPERT_ONLY=1
+            shift
+            ;;
         --save-only-model)
             SAVE_ONLY_MODEL=1
             shift
@@ -152,7 +164,7 @@ LAUNCH_CMD=(
     --max_steps "$MAX_STEPS"
     --warmup_ratio 0.05
     --weight_decay 1e-5
-    --learning_rate 1e-4
+    --learning_rate "$LEARNING_RATE"
     "${WANDB_FLAG[@]}"
     --global_batch_size "$GLOBAL_BATCH_SIZE"
     --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
@@ -201,6 +213,9 @@ if [ -n "$CROP_FRACTION" ]; then
 fi
 if [ -n "$DS_WEIGHTS_ALPHA" ]; then
     LAUNCH_CMD+=(--ds_weights_alpha "$DS_WEIGHTS_ALPHA")
+fi
+if [ "$DAGGER_EXPERT_ONLY" = "1" ]; then
+    LAUNCH_CMD+=(--dagger-expert-only)
 fi
 if [ -n "${SAVE_ONLY_MODEL:-}" ]; then
     LAUNCH_CMD+=(--save_only_model)

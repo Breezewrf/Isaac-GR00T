@@ -38,6 +38,7 @@ def _make_mock_config():
     config.data.episode_sampling_rate = 0.5
     config.data.seed = 42
     config.data.allow_padding = False
+    config.data.dagger_expert_only = False
     config.data.num_shards_per_epoch = 100
     config.data.override_pretraining_statistics = False
 
@@ -124,3 +125,24 @@ class TestDatasetFactory:
         factory = DatasetFactory(config)
         with pytest.raises(AssertionError, match="does not support evaluation"):
             factory.build(MagicMock())
+
+    def test_dagger_build_skips_recomputing_statistics(self):
+        from gr00t.data.dataset.factory import DatasetFactory
+
+        config = _make_mock_config()
+        config.data.dagger_expert_only = True
+        config.data.override_pretraining_statistics = False
+        dataset = MagicMock()
+        dataset.__len__.return_value = 1
+        with (
+            patch("gr00t.data.dataset.factory.generate_stats") as generate_stats,
+            patch("gr00t.data.dataset.factory.generate_rel_stats") as generate_rel_stats,
+            patch("gr00t.data.dataset.factory.ShardedSingleStepDataset", return_value=dataset) as dataset_cls,
+            patch("gr00t.data.dataset.factory.ShardedMixtureDataset") as mixture_cls,
+        ):
+            DatasetFactory(config).build(MagicMock())
+
+        generate_stats.assert_not_called()
+        generate_rel_stats.assert_not_called()
+        assert dataset_cls.call_args.kwargs["dagger_expert_only"] is True
+        assert mixture_cls.call_args.kwargs["reuse_pretraining_statistics"] is True
