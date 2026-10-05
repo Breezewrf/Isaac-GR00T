@@ -24,6 +24,7 @@ import tyro
 
 from gr00t.configs.base_config import get_default_config
 from gr00t.configs.finetune_config import FinetuneConfig
+from gr00t.data.dataset.finetune_data_config import load_finetune_data_config
 from gr00t.experiment.experiment import run
 
 
@@ -56,8 +57,10 @@ if __name__ == "__main__":
     if ft_config.modality_config_path is not None:
         load_modality_config(ft_config.modality_config_path)
 
-    dataset_paths = [path for path in ft_config.dataset_path.split(os.pathsep) if path]
-    if ft_config.dagger_expert_only and len(dataset_paths) != 1:
+    if bool(ft_config.dataset_path) == bool(ft_config.data_config_path):
+        raise ValueError("Provide exactly one of --dataset-path or --data-config-path")
+    dataset_paths = [path for path in (ft_config.dataset_path or "").split(os.pathsep) if path]
+    if ft_config.dataset_path and ft_config.dagger_expert_only and len(dataset_paths) != 1:
         raise ValueError("--dagger-expert-only requires exactly one DAgger dataset path")
 
     config = get_default_config().load_dict(
@@ -74,6 +77,14 @@ if __name__ == "__main__":
             }
         }
     )
+    if ft_config.data_config_path:
+        if ft_config.dagger_expert_only or ft_config.ds_weights_alpha is not None:
+            raise ValueError(
+                "Data YAML controls expert filtering and weights; omit dagger-expert-only and ds-weights-alpha"
+            )
+        config.load_dict(
+            {"data": load_finetune_data_config(ft_config.data_config_path, embodiment_tag)}
+        )
     config.load_config_path = None
 
     # overwrite with finetune config supplied by the user

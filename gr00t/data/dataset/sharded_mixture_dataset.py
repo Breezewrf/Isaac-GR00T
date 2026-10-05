@@ -54,7 +54,8 @@ def merge_statistics(
     information across all datasets.
 
     The weighted variance computation uses the formula:
-    Var_combined = Σ(w_i * (σ_i² + μ_i²)) - (Σ(w_i * μ_i))²
+    Var_combined = Σ(w_i * (σ_i² + (μ_i - μ_combined)²))
+    This parallel variance formula avoids subtracting large, nearly equal moments.
 
     Args:
         per_dataset_stats: List of per-dataset statistics dictionaries.
@@ -93,7 +94,7 @@ def merge_statistics(
 
         # Initialize accumulators for weighted mean and variance computation
         weighted_means = np.zeros(dim)
-        weighted_squares = np.zeros(dim)
+        weighted_variances = np.zeros(dim)
 
         # Collect min/max/quantiles from all datasets for global computation
         min_list = []
@@ -105,12 +106,10 @@ def merge_statistics(
         for dataset_idx, dataset_stats in enumerate(per_dataset_stats):
             w_i = normalized_weights[dataset_idx]
             stats = dataset_stats[modality]
-            means = np.array(stats["mean"])
-            stds = np.array(stats["std"])
+            means = np.asarray(stats["mean"], dtype=np.float64)
 
-            # Update weighted sums for mean and variance calculation
+            # Compute the mixture mean before accumulating centered variances.
             weighted_means += w_i * means
-            weighted_squares += w_i * (stds**2 + means**2)
 
             # Collect extremes and quantiles for global computation
             min_list.append(stats["min"])
@@ -120,8 +119,14 @@ def merge_statistics(
 
         # Compute final combined statistics
         overall_mean = weighted_means.tolist()
-        overall_variance = weighted_squares - weighted_means**2
-        overall_std = np.sqrt(overall_variance).tolist()
+        for dataset_idx, dataset_stats in enumerate(per_dataset_stats):
+            stats = dataset_stats[modality]
+            means = np.asarray(stats["mean"], dtype=np.float64)
+            stds = np.asarray(stats["std"], dtype=np.float64)
+            weighted_variances += normalized_weights[dataset_idx] * (
+                stds**2 + (means - weighted_means) ** 2
+            )
+        overall_std = np.sqrt(weighted_variances).tolist()
 
         # Global min/max across all datasets
         overall_min = np.min(np.array(min_list), axis=0).tolist()

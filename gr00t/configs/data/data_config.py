@@ -44,6 +44,11 @@ class SingleDatasetConfig:
 
     dataset_type: str = "physical_embodiment"
 
+    # Optional Hub source, resolved to a local snapshot by DatasetFactory.
+    repo_id: str | None = None
+    revision: str | None = None
+    dagger_expert_only: bool = False
+
     # Optional validation dataset path for open-loop evaluation
     # If not provided, falls back to dataset_paths for evaluation
     val_dataset_path: Optional[str] = None
@@ -94,6 +99,10 @@ class DataConfig:
     allow_padding: bool = False
     # Train only from action windows executed entirely by the human expert.
     dagger_expert_only: bool = False
+
+    # Used by the opt-in fine-tuning data YAML; legacy training keeps its defaults.
+    reuse_pretraining_statistics: bool = False
+    explicit_mixture_weights: bool = False
 
     # Subsample ratio for the dataset
     subsample_ratio: float = 1.0

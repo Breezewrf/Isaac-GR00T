@@ -75,7 +75,105 @@ CUDA_VISIBLE_DEVICES=0 NUM_GPUS=1 uv run bash examples/finetune.sh \
   --output-dir /tmp/robojudo_g1_23dof_finetune
 ```
 
+## Train on multiple SFT demonstration datasets
+
+Use the same `--data-config-path` entry point with every source set to `kind: sft`.
+Edit [sft_data.yaml](sft_data.yaml) with your compatible demonstration paths or Hub IDs
+and sampling weights. No physical dataset merge is required.
+
+```yaml
+normalization: recalculate
+datasets:
+  - kind: sft
+    path: /path/to/demo_a
+    weight: 0.6
+  - kind: sft
+    path: /path/to/demo_b
+    weight: 0.4
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=2 NUM_GPUS=1 uv run bash examples/finetune.sh \
+  --base-model-path nvidia/GR00T-N1.7-3B \
+  --data-config-path examples/RoboJuDo/sft_data.yaml \
+  --modality-config-path examples/RoboJuDo/robojudo_g1_23dof_config.py \
+  --embodiment-tag NEW_EMBODIMENT \
+  --output-dir /mnt/breeze/workspace/gr00t/checkpoints/g1_sft_mixture
+```
+
+`normalization: recalculate` computes new normalization parameters from the training data.
+It generates or validates each source's statistics cache and
+relative-action statistics, then aggregates them using the configured sampling weights.
+The merged statistics replace any statistics for the same embodiment in the base processor.
+Mean and variance follow mixture weights; min/max and percentile bounds use GR00T's
+existing conservative aggregation rather than computing exact pooled percentiles.
+Unlike `lerobot-edit-dataset merge`, which aggregates each feature by its source
+`count`, this mode uses the configured sampling weights. Matching source count ratios
+reproduces its mean/std aggregation for the same input statistics. The variance uses
+the stable parallel formula `sum(w * (std**2 + (mean - mixture_mean)**2))`.
+Source state/action statistics summarize recorded frames; relative-action statistics
+summarize valid action windows. These are not statistics recomputed from the randomly
+sampled training batches. Min/max and q01/q99 envelopes match the local LeRobot merge
+implementation, but the quantile bounds are not exact pooled percentiles.
+The training processor/checkpoint saves the resulting normalization parameters.
+Source directories must be writable for statistics caches; a missing `meta/stats.json`
+is allowed in this mode and generated before loading. No merged dataset directory or
+merged source `stats.json` is written.
+
+`normalization: inherit` is also supported for continued training on multiple SFT
+datasets when a matching checkpoint already has normalization statistics. DAgger sources
+require this mode: their full-rollout statistics include policy actions and therefore
+must not be used as expert-only normalization. Learning rate and other ordinary SFT
+defaults are unchanged; the YAML controls only data sources, weights, and normalization.
+
 ## Offline DAgger training for G1
+
+### Mix original SFT demonstrations and DAgger interventions
+
+Use `--data-config-path` to sample separate datasets without creating a merged dataset.
+Edit [dagger_data.yaml](dagger_data.yaml) to point at compatible original demonstrations
+and the full DAgger rollout dataset. Local paths are relative to the YAML file.
+Each source has `kind: sft` or `kind: dagger` and a positive `weight`; weights are
+normalized into target sample fractions. The example's 80/20 split is illustrative,
+not a training default. Replace the example SFT path with your actual dataset.
+
+```bash
+USE_WANDB=0 MAX_STEPS=200 SAVE_STEPS=50 \
+CUDA_VISIBLE_DEVICES=2 NUM_GPUS=1 uv run bash examples/finetune.sh \
+  --base-model-path /path/to/matching_g1_sft_checkpoint \
+  --data-config-path examples/RoboJuDo/dagger_data.yaml \
+  --modality-config-path examples/RoboJuDo/robojudo_g1_23dof_mulcam_config.py \
+  --embodiment-tag NEW_EMBODIMENT \
+  --learning-rate 1e-5 \
+  --output-dir /tmp/robojudo_g1_dagger_mixture
+```
+
+SFT sources are sampled normally and need no intervention fields. DAgger sources use
+`expert_applied` and `action_source` to require fully expert-applied action windows;
+policy actions never become supervision targets. Sources keep independent episode,
+frame, task, and video indices. No physical merge or merged `stats.json` is produced.
+Both sources use checkpoint state/action/relative-action normalization, controlled by
+`normalization: inherit`; source `meta/stats.json` must still exist for the loader.
+A generic base checkpoint without this embodiment's normalization statistics is rejected.
+
+For a Hub dataset replace `path` with `repo_id: owner/dataset`, optionally specifying
+`revision: v2.1` or a commit hash. Hub snapshots must contain actual GR00T-compatible
+v2.1 data, including `meta/modality.json`. Convert v3 sources first; revision tags do
+not convert formats. Hub data is resolved through the Hugging Face snapshot cache.
+
+Startup checks reject incompatible FPS, robot types, state/action group dimensions,
+and missing configured cameras. Also ensure joint ordering, units, viewpoints, and
+action semantics match; metadata checks cannot establish these physical meanings.
+Extra DAgger columns do not have to exist in SFT. Logs show valid window counts,
+target fractions, and scheduled sample fractions. The sampler accounts for shard sizes;
+fractions apply over samples over time, not as fixed quotas within every batch.
+
+`--dataset-path` and `--data-config-path` are mutually exclusive. The YAML determines
+expert filtering and weights, so omit `--dagger-expert-only` and `--ds-weights-alpha`.
+Learning rate, steps, and model tuning use existing options. Ordinary dataset-path
+training retains its existing defaults.
+
+### Train only the DAgger dataset
 
 After converting the label-aware recorder dataset to LeRobot v2.1, install the same three-camera
 modality mapping used by the original G1 SFT run:
@@ -118,7 +216,7 @@ a local one-step backward pass; use a larger GPU for that configuration.
 | Collection and updates | Collect with a fixed policy, then fine-tune on a fixed dataset | Collect and update the policy online using a rolling window of recent data | Collect interventions, then fine-tune offline; repeat in later rounds |
 | Saved data | Keep the whole rollout, including policy and expert segments, with per-frame `expert_applied` and `action_source` | Archive the whole successful episode, including policy and expert segments, with intervention labels | Current `record_autonomous=False` default saves correction windows as separate episodes; optional continuous mode also saves autonomous segments and intervention labels |
 | Training samples | Require all 16 actions in a chunk to be expert-applied; reject padding | With `only_save_expert=True`, require every non-padded action in a chunk to be a human intervention | The HIL tutorial uses ordinary policy fine-tuning; it does not specify an expert-only action-chunk sampler |
-| Original demonstrations | Initialize from the task SFT checkpoint; do not mix the old demonstration dataset into this run | Initialize from SFT; the real-world online sampler trains on its intervention data window | The HIL tutorial recommends fine-tuning on merged original demonstrations and HIL data |
+| Original demonstrations | Data YAML mixes original SFT demonstrations and DAgger expert windows; the legacy single-dataset example uses DAgger only | Initialize from SFT; the real-world online sampler trains on its intervention data window | The HIL tutorial recommends fine-tuning on merged original demonstrations and HIL data |
 | Normalization | Reuse state, action, and relative-action statistics from the matching G1 SFT checkpoint | Prepare and use the task's OpenPI normalization statistics | The HIL tutorial does not prescribe a common normalization strategy |
 | Evaluation | No automatic evaluation in this offline training path; compare checkpoints in a separate policy-only rollout | The example config sets evaluation to policy-only (`teleop: none`), but disables periodic validation | The tutorial deploys each fine-tuned checkpoint before the next collection round |
 

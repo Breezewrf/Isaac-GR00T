@@ -1,0 +1,14 @@
+# Local paths are relative to this YAML. Point SFT at compatible multi-camera demonstrations.
+# Weights are sample fractions over time, not exact counts within every batch.
+normalization: inherit
+datasets:
+  - kind: sft
+    path: ../../demo_data/g1_23dof_upper_body_pickup_mulcam
+    weight: 0.8
+  - kind: dagger
+    path: ../../../Humanoid/RoboJuDo-Plus/record_data/g1_23dof_upper_body_pickup_mulcam_dagger
+    weight: 0.2
+# For a Hub source, replace path with:
+#   repo_id: Breeze-park/your_dataset
+#   revision: v2.1
+# The selected revision must contain actual v2.1 data and meta/modality.json.

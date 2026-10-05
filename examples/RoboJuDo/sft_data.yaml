@@ -1,0 +1,12 @@
+# First SFT with multiple demonstrations: edit both paths to compatible datasets.
+# Paths are relative to this YAML; weights are illustrative sample fractions.
+normalization: recalculate
+datasets:
+  - kind: sft
+    path: /path/to/demo_a
+    weight: 0.6
+  - kind: sft
+    path: /path/to/demo_b
+    weight: 0.4
+# A Hub source can instead use repo_id: owner/dataset and revision: v2.1.
+# Sources must be writable so GR00T can generate/cache stats and relative stats.

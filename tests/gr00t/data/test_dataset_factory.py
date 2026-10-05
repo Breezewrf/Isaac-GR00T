@@ -39,6 +39,9 @@ def _make_mock_config():
     config.data.seed = 42
     config.data.allow_padding = False
     config.data.dagger_expert_only = False
+    config.data.reuse_pretraining_statistics = False
+    config.data.explicit_mixture_weights = False
+    config.data.ds_weights_alpha = None
     config.data.num_shards_per_epoch = 100
     config.data.override_pretraining_statistics = False
 
@@ -47,6 +50,8 @@ def _make_mock_config():
     dataset_spec.dataset_paths = ["/fake/dataset_path"]
     dataset_spec.embodiment_tag = "new_embodiment"
     dataset_spec.mix_ratio = 1.0
+    dataset_spec.repo_id = None
+    dataset_spec.dagger_expert_only = False
     config.data.datasets = [dataset_spec]
 
     config.data.modality_configs = {
@@ -137,7 +142,9 @@ class TestDatasetFactory:
         with (
             patch("gr00t.data.dataset.factory.generate_stats") as generate_stats,
             patch("gr00t.data.dataset.factory.generate_rel_stats") as generate_rel_stats,
-            patch("gr00t.data.dataset.factory.ShardedSingleStepDataset", return_value=dataset) as dataset_cls,
+            patch(
+                "gr00t.data.dataset.factory.ShardedSingleStepDataset", return_value=dataset
+            ) as dataset_cls,
             patch("gr00t.data.dataset.factory.ShardedMixtureDataset") as mixture_cls,
         ):
             DatasetFactory(config).build(MagicMock())

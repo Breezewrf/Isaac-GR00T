@@ -18,6 +18,7 @@ DAGGER_EXPERT_ONLY=0
 
 BASE_MODEL_PATH=""
 DATASET_PATH=""
+DATA_CONFIG_PATH=""
 MODALITY_CONFIG_PATH=""
 EMBODIMENT_TAG=""
 OUTPUT_DIR=""
@@ -34,7 +35,7 @@ usage() {
     cat <<'EOF'
 Usage: bash examples/finetune.sh \
   --base-model-path <path> \
-  --dataset-path <path> \
+  (--dataset-path <path> | --data-config-path <yaml>) \
   --embodiment-tag <tag> \
   --output-dir <path> \
   [--modality-config-path <path>] \
@@ -60,6 +61,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --dataset-path)
             DATASET_PATH="$2"
+            shift 2
+            ;;
+        --data-config-path)
+            DATA_CONFIG_PATH="$2"
             shift 2
             ;;
         --modality-config-path)
@@ -139,13 +144,19 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-for required_var in BASE_MODEL_PATH DATASET_PATH EMBODIMENT_TAG OUTPUT_DIR; do
+for required_var in BASE_MODEL_PATH EMBODIMENT_TAG OUTPUT_DIR; do
     if [ -z "${!required_var}" ]; then
         echo "Missing required argument: ${required_var}" >&2
         usage >&2
         exit 1
     fi
 done
+
+if { [ -z "$DATASET_PATH" ] && [ -z "$DATA_CONFIG_PATH" ]; } ||
+   { [ -n "$DATASET_PATH" ] && [ -n "$DATA_CONFIG_PATH" ]; }; then
+    echo "Provide exactly one of --dataset-path or --data-config-path" >&2
+    exit 1
+fi
 
 WANDB_FLAG=()
 if [ "$USE_WANDB" = "1" ]; then
@@ -155,7 +166,6 @@ fi
 LAUNCH_CMD=(
     gr00t/experiment/launch_finetune.py
     --base_model_path "$BASE_MODEL_PATH"
-    --dataset_path "$DATASET_PATH"
     --embodiment_tag "$EMBODIMENT_TAG"
     --num_gpus "$NUM_GPUS"
     --output_dir "$OUTPUT_DIR"
@@ -172,6 +182,12 @@ LAUNCH_CMD=(
     --num_shards_per_epoch "$NUM_SHARDS_PER_EPOCH"
     --episode_sampling_rate "$EPISODE_SAMPLING_RATE"
 )
+
+if [ -n "$DATA_CONFIG_PATH" ]; then
+    LAUNCH_CMD+=(--data-config-path "$DATA_CONFIG_PATH")
+else
+    LAUNCH_CMD+=(--dataset_path "$DATASET_PATH")
+fi
 
 if [ -n "$MODALITY_CONFIG_PATH" ]; then
     LAUNCH_CMD+=(--modality_config_path "$MODALITY_CONFIG_PATH")

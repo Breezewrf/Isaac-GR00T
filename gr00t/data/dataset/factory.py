@@ -17,6 +17,11 @@ import numpy as np
 from tqdm import tqdm
 
 from gr00t.configs.base_config import Config
+from gr00t.data.dataset.finetune_data_config import (
+    resolve_hub_source,
+    validate_lerobot_source,
+    validate_mixture_inputs,
+)
 from gr00t.data.dataset.sharded_mixture_dataset import ShardedMixtureDataset
 from gr00t.data.dataset.sharded_single_step_dataset import ShardedSingleStepDataset
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -44,6 +49,12 @@ class DatasetFactory:
         all_datasets = []
         all_weights = []
         dagger_expert_only = self.config.data.dagger_expert_only
+        reuse_statistics = (
+            dagger_expert_only or self.config.data.reuse_pretraining_statistics is True
+        )
+        explicit_weights = self.config.data.explicit_mixture_weights is True
+        if explicit_weights and self.config.data.ds_weights_alpha is not None:
+            raise ValueError("Explicit mixture weights cannot be combined with ds_weights_alpha")
         if (
             dagger_expert_only
             and sum(len(spec.dataset_paths) for spec in self.config.data.datasets) != 1
@@ -55,12 +66,25 @@ class DatasetFactory:
             desc="Initializing datasets",
         ):
             datasets = []
-            for dataset_path in dataset_spec.dataset_paths:
+            dataset_paths = list(dataset_spec.dataset_paths)
+            if getattr(dataset_spec, "repo_id", None) and not dataset_paths:
+                with run_or_wait_on_rank0(label=f"download({dataset_spec.repo_id})") as is_rank0:
+                    if is_rank0:
+                        resolve_hub_source(dataset_spec.repo_id, dataset_spec.revision)
+                dataset_paths = [
+                    resolve_hub_source(
+                        dataset_spec.repo_id, dataset_spec.revision, local_files_only=True
+                    )
+                ]
+            expert_only = dagger_expert_only or dataset_spec.dagger_expert_only is True
+            for dataset_path in dataset_paths:
                 embodiment_tag = dataset_spec.embodiment_tag
                 assert embodiment_tag is not None, "Embodiment tag is required"
                 assert self.config.data.mode == "single_turn", "Only single turn mode is supported"
                 # rank-0 writes stats; helper barriers before peers read them.
-                if not dagger_expert_only:
+                if explicit_weights:
+                    validate_lerobot_source(dataset_path, require_statistics=reuse_statistics)
+                if not reuse_statistics:
                     with run_or_wait_on_rank0(label=f"generate_stats({dataset_path})") as is_rank0:
                         if is_rank0:
                             generate_stats(dataset_path)
@@ -73,15 +97,30 @@ class DatasetFactory:
                     episode_sampling_rate=self.config.data.episode_sampling_rate,
                     seed=self.config.data.seed,
                     allow_padding=self.config.data.allow_padding,
-                    dagger_expert_only=dagger_expert_only,
+                    dagger_expert_only=expert_only,
                 )
                 datasets.append(dataset)
-            dataset_lengths = np.array([len(dataset) for dataset in datasets])
+            dataset_lengths = np.array(
+                [
+                    sum(dataset.shard_lengths) if explicit_weights else len(dataset)
+                    for dataset in datasets
+                ]
+            )
             dataset_relative_lengths = dataset_lengths / dataset_lengths.sum()
             for dataset, relative_length in zip(datasets, dataset_relative_lengths):
                 weight = relative_length * dataset_spec.mix_ratio
                 all_datasets.append(dataset)
                 all_weights.append(weight)
+
+        if explicit_weights:
+            validate_mixture_inputs(all_datasets, processor if reuse_statistics else None)
+            total_weight = sum(all_weights)
+            for index, (dataset, weight) in enumerate(zip(all_datasets, all_weights)):
+                print(
+                    f"Mixture source {index}: {dataset.dataset_path}; "
+                    f"expert_only={dataset.dagger_expert_only}; "
+                    f"valid_windows={sum(dataset.shard_lengths)}; target_fraction={weight / total_weight:.6f}"
+                )
 
         alpha = self.config.data.ds_weights_alpha
         if alpha is not None and len(all_datasets) > 1:
@@ -92,16 +131,23 @@ class DatasetFactory:
                 "this overrides per-dataset mix_ratio sampling weights."
             )
 
-        return (
-            ShardedMixtureDataset(
-                datasets=all_datasets,
-                weights=all_weights,
-                processor=processor,
-                seed=self.config.data.seed,
-                training=True,
-                num_shards_per_epoch=self.config.data.num_shards_per_epoch,
-                override_pretraining_statistics=self.config.data.override_pretraining_statistics,
-                reuse_pretraining_statistics=dagger_expert_only,
-            ),
-            None,
+        train_dataset = ShardedMixtureDataset(
+            datasets=all_datasets,
+            weights=all_weights,
+            processor=processor,
+            seed=self.config.data.seed,
+            training=True,
+            num_shards_per_epoch=self.config.data.num_shards_per_epoch,
+            override_pretraining_statistics=self.config.data.override_pretraining_statistics,
+            reuse_pretraining_statistics=reuse_statistics,
         )
+        if explicit_weights:
+            scheduled_windows = np.zeros(len(all_datasets), dtype=np.int64)
+            for dataset_index, shard_index in train_dataset.shard_sampling_schedule:
+                scheduled_windows[dataset_index] += all_datasets[dataset_index].get_shard_length(
+                    shard_index
+                )
+            fractions = scheduled_windows / scheduled_windows.sum()
+            for index, fraction in enumerate(fractions):
+                print(f"Mixture source {index}: scheduled_sample_fraction={fraction:.6f}")
+        return train_dataset, None
